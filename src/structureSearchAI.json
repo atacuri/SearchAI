@@ -1,0 +1,19 @@
+{
+    "name": "Nombre del sitio (ej: Google Scholar, Springer, DBLP)",
+    "url": "URL base del sitio (ej: https://scholar.google.com)",
+    "domain": "Dominio temático (ej: academic, scientific, bibliographic)",
+    "search_url": "URL de búsqueda con {query} como placeholder (ej: https://scholar.google.com/scholar?q={query})",
+    "search_params": {
+        "q": "query"
+    },
+    "object_semantic_structure_schema": {
+        "type": "Tipo semántico (ej: ArticleScientific, ConferencePaper, JournalArticle)"
+    },
+    "properties_schema": {
+        "type_schema": "Tipo propiedad (ej: Nombre, Precio, Autor)",
+        "name_schema": "Nombre propiedad (ej: Nombre, Precio, Autor)",
+        "selector_css_schema": "Selector CSS (ej: .nombre, .precio, .autor)"
+    },
+    "properties_object_semantic_structure_schema": ["Lista de propiedades del objeto semantico con la estructura de properties_schema "]
+ 
+}

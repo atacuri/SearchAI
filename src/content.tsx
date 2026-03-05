@@ -3,7 +3,7 @@
 
 import { useState, useRef, useEffect } from "react"
 import type { PlasmoCSConfig, PlasmoGetStyle } from "plasmo"
-import type { DSLCommand, ScrapeResult, ScrapedArticle, CreateStructureResult, ListStructuresResult, SiteStructure } from "./types"
+import type { DSLCommand, ScrapeResult, ScrapedItem, CreateStructureResult, ListStructuresResult, SiteStructure, PropertySchema } from "./types"
 import { parseWithAI, isAIConfigured } from "./dsl/aiParser"
 import { executePageCommand } from "./dsl/pageExecutor"
 import { getAIConfig, saveAIConfig, clearAIConfig, type AIConfig } from "./services/aiService"
@@ -841,9 +841,105 @@ function FloatingPrompt() {
     }
   }
 
+  const normalizeParsedCommand = (rawInput: string, parsed: DSLCommand | null): DSLCommand | null => {
+    const text = rawInput.toLowerCase().trim()
+    const wantsInvisible =
+      text.includes('invisible') ||
+      text.includes('segundo plano') ||
+      text.includes('sin abrir pestaña') ||
+      text.includes('sin abrir pestana') ||
+      text.includes('sin abrir tab')
+
+    // Si la IA devolvió búsqueda de sitio, forzar modo visible/invisible según el texto
+    if (parsed?.action === 'searchSite' && !wantsInvisible) {
+      return {
+        action: 'searchSiteVisible',
+        params: parsed.params
+      }
+    }
+    if (parsed?.action === 'searchSiteVisible' && wantsInvisible) {
+      return {
+        action: 'searchSite',
+        params: parsed.params
+      }
+    }
+
+    // Fallback regex para frases comunes, incluso si la IA falla
+    const inSiteMatch = rawInput.match(/en\s+(.+?)\s+busca(?:r)?\s+(.+)/i)
+    if (inSiteMatch) {
+      const site = inSiteMatch[1]?.trim()
+      const query = inSiteMatch[2]?.trim()
+      if (site && query) {
+        return {
+          action: wantsInvisible ? 'searchSite' : 'searchSiteVisible',
+          params: { site, query }
+        }
+      }
+    }
+
+    const searchInMatch = rawInput.match(/busca(?:r)?\s+(.+?)\s+en\s+(.+)/i)
+    if (searchInMatch) {
+      const query = searchInMatch[1]?.trim()
+      const site = searchInMatch[2]?.trim()
+      if (site && query) {
+        return {
+          action: wantsInvisible ? 'searchSite' : 'searchSiteVisible',
+          params: { site, query }
+        }
+      }
+    }
+
+    return parsed
+  }
+
+  const extractVisibleSearchIntent = (rawInput: string): { site: string; query: string } | null => {
+    const text = rawInput.trim()
+    const lower = text.toLowerCase()
+    const wantsInvisible =
+      lower.includes('invisible') ||
+      lower.includes('segundo plano') ||
+      lower.includes('sin abrir pestaña') ||
+      lower.includes('sin abrir pestana') ||
+      lower.includes('sin abrir tab')
+
+    if (wantsInvisible) return null
+
+    const inSiteMatch = text.match(/en\s+(.+?)\s+busca(?:r)?\s+(.+)/i)
+    if (inSiteMatch?.[1] && inSiteMatch?.[2]) {
+      return { site: inSiteMatch[1].trim(), query: inSiteMatch[2].trim() }
+    }
+
+    const searchInMatch = text.match(/busca(?:r)?\s+(.+?)\s+en\s+(.+)/i)
+    if (searchInMatch?.[1] && searchInMatch?.[2]) {
+      return { site: searchInMatch[2].trim(), query: searchInMatch[1].trim() }
+    }
+
+    return null
+  }
+
+  const buildLocalSearchUrl = (siteName: string, query: string): string | null => {
+    const site = siteName.toLowerCase()
+    const encoded = encodeURIComponent(query)
+
+    if (site.includes('scholar') || site.includes('scgolar') || site.includes('google scholar')) {
+      return `https://scholar.google.com/scholar?q=${encoded}`
+    }
+    if (site.includes('springer')) {
+      return `https://link.springer.com/search?query=${encoded}`
+    }
+    if (site.includes('dblp')) {
+      return `https://dblp.org/search?q=${encoded}`
+    }
+    if (site.includes('amazon')) {
+      return `https://www.amazon.com/s?k=${encoded}`
+    }
+    return null
+  }
+
   const handleSubmit = async (e?: React.FormEvent) => {
     e?.preventDefault()
     if (!input.trim() || loading) return
+    const rawInput = input.trim()
 
     if (!aiReady) {
       setError('Configura tu API key de IA primero')
@@ -855,19 +951,54 @@ function FloatingPrompt() {
     setError(null)
     setResult(null)
 
+    // Anti-popup-blocker: preabre una pestaña durante el gesto del usuario.
+    const visibleIntent = extractVisibleSearchIntent(rawInput)
+    let preOpenedTab: Window | null = null
+    if (visibleIntent) {
+      preOpenedTab = window.open('about:blank', '_blank')
+    }
+
     try {
-      const command = await parseWithAI(input)
+      const aiCommand = await parseWithAI(rawInput)
+      const command = normalizeParsedCommand(rawInput, aiCommand)
 
       if (!command || !command.action) {
+        if (preOpenedTab && !preOpenedTab.closed) preOpenedTab.close()
         setError('La IA no pudo interpretar el comando. Intenta reformularlo.')
         setLoading(false)
         return
       }
 
       const res = await executePageCommand(command)
+
+      if (preOpenedTab && !preOpenedTab.closed) {
+        if (command.action === 'searchSiteVisible' && res?.url) {
+          preOpenedTab.location.href = res.url
+        } else {
+          preOpenedTab.close()
+        }
+      }
+
       setResult(res)
       setInput("")
     } catch (err: any) {
+      if (preOpenedTab && !preOpenedTab.closed && visibleIntent) {
+        const localUrl = buildLocalSearchUrl(visibleIntent.site, visibleIntent.query)
+        if (localUrl) {
+          preOpenedTab.location.href = localUrl
+          setResult({
+            action: 'searchSiteVisible',
+            success: true,
+            url: localUrl,
+            message: `Se abrió una nueva pestaña con fallback local para "${visibleIntent.query}".`
+          })
+          setInput("")
+          setLoading(false)
+          return
+        }
+        preOpenedTab.close()
+      }
+
       console.error('[FloatingPrompt] Error completo:', err)
       const msg = err.message || "Error desconocido"
       // Siempre mostrar el error completo para poder diagnosticar
@@ -1085,7 +1216,7 @@ function FloatingPrompt() {
                           </span>
                           <div style={{ display: 'flex', gap: '4px', alignItems: 'center' }}>
                             <span className="structure-card-badge">
-                              {s.semantic_structure.type}
+                              {s.object_semantic_structure_schema?.type || 'General'}
                             </span>
                             <button
                               className="delete-structure-btn"
@@ -1109,13 +1240,26 @@ function FloatingPrompt() {
 
                           <span className="info-label">🔍 Búsqueda:</span>
                           <span className="info-value">{s.search_url || '(no configurada)'}</span>
+
+                          <span className="info-label">🎯 Props:</span>
+                          <span className="info-value">
+                            {(s.properties_object_semantic_structure_schema || [])
+                              .map((p: PropertySchema) => p.name_schema)
+                              .join(', ') || '(sin propiedades)'}
+                          </span>
                         </div>
 
                         <div className="structure-card-selectors">
-                          {Object.entries(s.selectors).map(([key, value]) => (
-                            <div key={key} className="sel-row">
-                              <span className="sel-name">{key}:</span>
-                              <span className="sel-value">{value || '—'}</span>
+                          <div className="sel-row">
+                            <span className="sel-name">container:</span>
+                            <span className="sel-value">{s.result_container_selector || '—'}</span>
+                          </div>
+                          {(s.properties_object_semantic_structure_schema || []).map((prop: PropertySchema, idx: number) => (
+                            <div key={idx} className="sel-row">
+                              <span className="sel-name">
+                                <span style={{ color: '#6c5ce7' }}>[{prop.type_schema}]</span> {prop.name_schema}:
+                              </span>
+                              <span className="sel-value">{prop.selector_css_schema || '—'}</span>
                             </div>
                           ))}
                         </div>
@@ -1144,20 +1288,30 @@ function FloatingPrompt() {
                     </div>
                     <div className="detail-row">
                       <span className="detail-label">🔍 Búsqueda:</span>
-                      <span className="detail-value">{(result as CreateStructureResult).structure.search_url}</span>
+                      <span className="detail-value">{(result as CreateStructureResult).structure.search_url || '(no detectada)'}</span>
                     </div>
                     <div className="detail-row">
-                      <span className="detail-label">📚 Tipo:</span>
-                      <span className="detail-value">{(result as CreateStructureResult).structure.semantic_structure.type}</span>
+                      <span className="detail-label">📚 Tipo objeto:</span>
+                      <span className="detail-value">{(result as CreateStructureResult).structure.object_semantic_structure_schema.type}</span>
+                    </div>
+                    <div className="detail-row">
+                      <span className="detail-label">🎯 Contenedor:</span>
+                      <span className="detail-value" style={{ fontFamily: 'monospace', fontSize: '10px' }}>
+                        {(result as CreateStructureResult).structure.result_container_selector}
+                      </span>
                     </div>
                   </div>
 
                   <div className="selectors-grid">
-                    <strong style={{ fontSize: '11px', color: '#1b5e20' }}>Selectores CSS:</strong>
-                    {Object.entries((result as CreateStructureResult).structure.selectors).map(([key, value]) => (
-                      <div key={key} className="selector-row">
-                        <span className="selector-name">{key}:</span>
-                        <span className="selector-value">{value || '(vacío)'}</span>
+                    <strong style={{ fontSize: '11px', color: '#1b5e20' }}>
+                      Propiedades ({(result as CreateStructureResult).structure.properties_object_semantic_structure_schema.length}):
+                    </strong>
+                    {(result as CreateStructureResult).structure.properties_object_semantic_structure_schema.map((prop: PropertySchema, idx: number) => (
+                      <div key={idx} className="selector-row">
+                        <span className="selector-name">
+                          <span style={{ color: '#6c5ce7', fontSize: '8px' }}>[{prop.type_schema}]</span> {prop.name_schema}:
+                        </span>
+                        <span className="selector-value">{prop.selector_css_schema}</span>
                       </div>
                     ))}
                   </div>
@@ -1165,6 +1319,25 @@ function FloatingPrompt() {
                   <div className="structure-message">
                     ✅ {(result as CreateStructureResult).message}
                   </div>
+                </div>
+              </div>
+            )}
+
+            {result && result.action === "searchSiteVisible" && (
+              <div className="result-area">
+                <div className="result-success">
+                  🚀 {result.message}
+                  <div style={{ marginTop: "6px", fontSize: "11px" }}>
+                    🔗 <a href={result.url} target="_blank" rel="noopener noreferrer">{result.url}</a>
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {result && result.action === "highlightByCondition" && (
+              <div className="result-area">
+                <div className="result-success">
+                  ✨ {result.message}
                 </div>
               </div>
             )}
@@ -1187,7 +1360,6 @@ function FloatingPrompt() {
                           navigator.clipboard.writeText(jsonStr)
                             .then(() => alert('JSON copiado al portapapeles'))
                             .catch(() => {
-                              // Fallback para cuando clipboard no funciona en Shadow DOM
                               const textArea = document.createElement('textarea')
                               textArea.value = jsonStr
                               document.body.appendChild(textArea)
@@ -1205,7 +1377,8 @@ function FloatingPrompt() {
                   <div className="scrape-meta">
                     🔍 Query: <strong>{(result as ScrapeResult).query}</strong> | 
                     📚 Tipo: {(result as ScrapeResult).semantic_type} | 
-                    🌐 {(result as ScrapeResult).domain}
+                    🌐 {(result as ScrapeResult).domain} |
+                    🎯 Props: {(result as ScrapeResult).properties?.join(', ')}
                   </div>
 
                   {showJson ? (
@@ -1214,40 +1387,45 @@ function FloatingPrompt() {
                     </div>
                   ) : (
                     <div className="scrape-articles">
-                      {(result as ScrapeResult).results.map((article: ScrapedArticle, i: number) => (
-                        <div key={`article-${i}`} className="scrape-article">
-                          {article.url ? (
-                            <a
-                              className="scrape-article-title"
-                              href={article.url}
-                              target="_blank"
-                              rel="noopener noreferrer">
-                              {article.title}
-                            </a>
-                          ) : (
-                            <span className="scrape-article-title">{article.title}</span>
+                      {(result as ScrapeResult).results.map((item: ScrapedItem, i: number) => (
+                        <div key={`item-${i}`} className="scrape-article">
+                          {/* Título: buscar propiedad "title" o "name" */}
+                          {(item.title || item.name) && (
+                            item.url ? (
+                              <a
+                                className="scrape-article-title"
+                                href={item.url}
+                                target="_blank"
+                                rel="noopener noreferrer">
+                                {item.title || item.name}
+                              </a>
+                            ) : (
+                              <span className="scrape-article-title">{item.title || item.name}</span>
+                            )
                           )}
                           
-                          {article.authors.length > 0 && (
-                            <div className="scrape-article-authors">
-                              👤 {article.authors.map(a => a.name).join(', ')}
-                            </div>
-                          )}
+                          {/* Renderizar todas las propiedades dinámicas (excepto title, name, url ya mostrados) */}
+                          {Object.entries(item)
+                            .filter(([key]) => !['title', 'name', 'url'].includes(key))
+                            .map(([key, value]) => {
+                              if (!value || value === '' || value === '0' || (Array.isArray(value) && value.length === 0)) return null
+                              
+                              const displayValue = Array.isArray(value) ? value.join(', ') : String(value)
+                              if (!displayValue || displayValue.length === 0) return null
 
-                          <div className="scrape-article-meta">
-                            {article.date && <span>📅 {article.date}</span>}
-                            {article.citations !== '0' && (
-                              <span style={{ marginLeft: 8 }}>📊 Citado por: {article.citations}</span>
-                            )}
-                          </div>
-
-                          {article.abstract && (
-                            <div className="scrape-article-abstract">
-                              {article.abstract.length > 200
-                                ? article.abstract.substring(0, 200) + '...'
-                                : article.abstract}
-                            </div>
-                          )}
+                              return (
+                                <div key={key} className="scrape-article-meta" style={{ marginBottom: '2px' }}>
+                                  <span style={{ fontWeight: 600, color: '#555', fontSize: '10px' }}>
+                                    {key}:
+                                  </span>{' '}
+                                  <span style={{ color: '#666', fontSize: '10px' }}>
+                                    {displayValue.length > 200
+                                      ? displayValue.substring(0, 200) + '...'
+                                      : displayValue}
+                                  </span>
+                                </div>
+                              )
+                            })}
                         </div>
                       ))}
                     </div>
@@ -1260,6 +1438,10 @@ function FloatingPrompt() {
               🤖 Todo pasa por IA — escribe naturalmente.
               <br />
               Ej: "crea la estructura" → "en scholar busca iot"
+              <br />
+              Ej visible: "en scholar busca iot visible"
+              <br />
+              Ej highlight: "resalta artículos con más de 100 citas"
               <br />
               📂 "ver sitios" para listar las estructuras guardadas.
             </div>

@@ -29,6 +29,11 @@ interface FetchPageRequest {
   url: string
 }
 
+interface OpenTabRequest {
+  type: "OPEN_TAB"
+  url: string
+}
+
 interface AIResponse {
   success: boolean
   command?: { action: string; params: Record<string, any> } | null
@@ -47,7 +52,14 @@ interface FetchPageResponse {
   error?: string
 }
 
-type MessageRequest = AIRequest | AIAnalyzePageRequest | FetchPageRequest
+interface OpenTabResponse {
+  success: boolean
+  tabId?: number
+  url?: string
+  error?: string
+}
+
+type MessageRequest = AIRequest | AIAnalyzePageRequest | FetchPageRequest | OpenTabRequest
 
 // ============ Listener principal ============
 
@@ -88,6 +100,18 @@ chrome.runtime.onMessage.addListener(
         })
       return true
     }
+
+    if (message.type === "OPEN_TAB") {
+      handleOpenTab(message as OpenTabRequest)
+        .then(sendResponse)
+        .catch((err) => {
+          sendResponse({
+            success: false,
+            error: err.message || "Error al abrir la pestaña"
+          })
+        })
+      return true
+    }
   }
 )
 
@@ -117,6 +141,28 @@ async function handleFetchPage(request: FetchPageRequest): Promise<FetchPageResp
     return {
       success: false,
       error: `Error al obtener la página: ${err.message}`
+    }
+  }
+}
+
+// ============ Handler: Abrir nueva pestaña ============
+
+async function handleOpenTab(request: OpenTabRequest): Promise<OpenTabResponse> {
+  try {
+    const tab = await chrome.tabs.create({
+      url: request.url,
+      active: true
+    })
+
+    return {
+      success: true,
+      tabId: tab.id,
+      url: tab.url || request.url
+    }
+  } catch (err: any) {
+    return {
+      success: false,
+      error: `Error al abrir pestaña: ${err.message}`
     }
   }
 }
@@ -171,9 +217,8 @@ async function handleAnalyzePage(request: AIAnalyzePageRequest): Promise<Analyze
     }
 
     const result = await callAI(provider, apiKey, model || defaultModel, systemPrompt, userMessage)
-    console.log('result', result)
-    if (!result || !result.selectors) {
-      
+    console.log('[Background] AI analyze result:', result)
+    if (!result || !result.result_container_selector || !result.properties_object_semantic_structure_schema) {
       return { success: false, error: "La IA no pudo identificar la estructura de la página" }
     }
 
@@ -380,24 +425,35 @@ ${colorsList}
    - Parámetros: {}
    - Ejemplos: "extraer resultados", "scrapear página", "obtener artículos", "recoger datos"
 
-4. searchSite: Busca en un sitio configurado y extrae los resultados automáticamente
+4. searchSite: Busca en un sitio configurado y extrae los resultados automáticamente (modo invisible)
    - Parámetros: { "site": string, "query": string }
    - "site" es el nombre del sitio (ej: "Google Scholar", "Springer", "DBLP")
    - "query" es lo que el usuario quiere buscar
-   - Ejemplos: "en google scholar busca iot", "busca machine learning en springer", "en dblp busca deep learning"
+   - Ejemplos: "en google scholar busca iot invisible", "busca machine learning en springer en segundo plano", "en dblp busca deep learning sin abrir pestaña"
 
-5. createStructure: Analiza la página actual y crea la estructura de scraping con IA
+5. searchSiteVisible: Busca en un sitio configurado y abre la búsqueda en una pestaña nueva (visible)
+   - Parámetros: { "site": string, "query": string }
+   - Ejemplos: "en google scholar busca iot", "abre en nueva pestaña google scholar con iot", "en google scholar busca iot visible", "quiero ver la búsqueda en springer de llm"
+
+6. createStructure: Analiza la página actual y crea la estructura de scraping con IA
    - Parámetros: {}
    - Ejemplos: "crea la estructura", "analiza esta página", "genera la estructura", "configura este sitio", "aprende este sitio", "analiza los selectores"
 
-6. listStructures: Muestra todas las estructuras de sitios guardadas
+7. listStructures: Muestra todas las estructuras de sitios guardadas
    - Parámetros: {}
    - Ejemplos: "mostrar estructuras", "listar sitios", "ver estructuras", "qué sitios hay", "mostrar sitios configurados", "ver sitios guardados"
 
-7. deleteStructure: Elimina una estructura guardada por nombre
+8. deleteStructure: Elimina una estructura guardada por nombre
    - Parámetros: { "name": string }
    - "name" es el nombre del sitio a eliminar
    - Ejemplos: "elimina la estructura de DBLP", "borra el sitio Springer", "eliminar estructura Google Scholar"
+
+9. highlightByCondition: Resalta en la página actual solo los resultados que cumplen una condición
+   - Parámetros: { "property": string, "operator": string, "value": number|string }
+   - "property" es el nombre de la propiedad (ej: citations, price, year, rating)
+   - "operator" puede ser: ">", ">=", "<", "<=", "=", "!=", "contains"
+   - "value" es el valor a comparar
+   - Ejemplos: "resalta artículos con más de 100 citas", "resaltar productos con precio mayor a 500", "marca resultados con year >= 2020"
 
 INSTRUCCIONES:
 - Responde SOLO con un objeto JSON válido
@@ -406,65 +462,129 @@ INSTRUCCIONES:
   { "action": "getTitles", "params": {} }
   { "action": "scrapeResults", "params": {} }
   { "action": "searchSite", "params": { "site": "Google Scholar", "query": "iot" } }
+  { "action": "searchSiteVisible", "params": { "site": "Google Scholar", "query": "iot" } }
   { "action": "createStructure", "params": {} }
   { "action": "listStructures", "params": {} }
   { "action": "deleteStructure", "params": { "name": "DBLP" } }
+  { "action": "highlightByCondition", "params": { "property": "citations", "operator": ">", "value": 100 } }
 - Si no entiendes el comando: { "action": null, "params": {} }
-- Para buscar EN un sitio: usa searchSite
+- Por defecto, para frases tipo "en [sitio] busca [query]": usa searchSiteVisible
+- Si el usuario pide "invisible", "en segundo plano", "sin abrir pestaña": usa searchSite (modo invisible + extracción)
 - Para extraer datos de la página actual: usa scrapeResults
 - Para analizar/aprender la estructura de una página: usa createStructure
 - Para ver las estructuras guardadas: usa listStructures
 - Para eliminar una estructura: usa deleteStructure
+- Para resaltar resultados por condición en la página actual: usa highlightByCondition
 - "scholar" = "Google Scholar", "springer" = "Springer", "dblp" = "DBLP"`
 }
 
 // ============ System Prompt: Análisis de estructura de página ============
 
-function buildAnalyzePagePrompt(): string {
-  return `Eres un experto en web scraping. Tu tarea es analizar el HTML de una página de resultados de búsqueda y devolver los selectores CSS que permiten extraer datos estructurados.
-
-INSTRUCCIONES:
-1. Analiza el HTML proporcionado de una página de resultados de búsqueda (académica, bibliográfica, etc.)
-2. Identifica:
-   - El CONTENEDOR de cada resultado individual (el div/article/li que se repite por cada resultado)
-   - El TÍTULO de cada resultado
-   - El LINK del título (el <a> que envuelve al título)
-   - Los AUTORES (texto o links)
-   - La FECHA o AÑO de publicación
-   - El ABSTRACT o snippet/resumen
-   - Las CITACIONES (si existen)
-3. Identifica la URL de búsqueda del sitio y los parámetros de búsqueda
-
-RESPONDE SOLO con un JSON válido con esta estructura exacta:
-{
-  "name": "Nombre del sitio (ej: Google Scholar, Springer, DBLP)",
-  "url": "URL base del sitio (ej: https://scholar.google.com)",
-  "domain": "Dominio temático (ej: academic, scientific, bibliographic)",
-  "search_url": "URL de búsqueda con {query} como placeholder (ej: https://scholar.google.com/scholar?q={query})",
-  "search_params": { "q": "query" },
-  "selectors": {
-    "resultContainer": "selector CSS del contenedor de CADA resultado",
-    "title": "selector CSS del título dentro del contenedor",
-    "titleLink": "selector CSS del link del título",
-    "authors": "selector CSS del texto de autores",
-    "authorLinks": "selector CSS de los links de autores",
-    "date": "selector CSS del elemento que contiene la fecha",
-    "abstract": "selector CSS del abstract/snippet",
-    "citations": "selector CSS del elemento con info de citaciones"
+/**
+ * Schema base leído de structureSearchAI.json — define el formato de salida esperado.
+ * La IA debe generar la estructura siguiendo este schema.
+ */
+const STRUCTURE_SCHEMA = {
+  name: "Nombre del sitio (ej: Google Scholar, Springer, DBLP)",
+  url: "URL base del sitio (ej: https://scholar.google.com)",
+  domain: "Dominio temático (ej: academic, scientific, bibliographic, e-commerce, news)",
+  search_url: "URL de búsqueda con {query} como placeholder (ej: https://scholar.google.com/scholar?q={query})",
+  search_params: { q: "query" },
+  result_container_selector: "Selector CSS del contenedor que se REPITE por cada resultado",
+  object_semantic_structure_schema: {
+    type: "Tipo semántico del objeto (ej: ArticleScientific, ConferencePaper, Product, NewsArticle)"
   },
-  "semantic_structure": {
-    "type": "Tipo semántico (ej: ArticleScientific, ConferencePaper, JournalArticle)"
-  }
+  properties_schema: {
+    type_schema: "Tipo de extracción: string | url | number | date | array | html",
+    name_schema: "Nombre de la propiedad (ej: title, authors, price, date)",
+    selector_css_schema: "Selector CSS relativo al contenedor del resultado"
+  },
+  properties_object_semantic_structure_schema: [
+    "Array de propiedades del objeto, cada una con la estructura de properties_schema"
+  ]
 }
 
-REGLAS IMPORTANTES:
-- Los selectores deben ser CSS válidos y lo más específicos posible
-- El "resultContainer" es el selector del elemento que se REPITE una vez por cada resultado
-- Los otros selectores son RELATIVOS al resultContainer (dentro de cada resultado)
-- Si un campo no existe en la página, usa una cadena vacía ""
+function buildAnalyzePagePrompt(): string {
+  return `Eres un experto en web scraping y análisis de estructuras HTML. Tu tarea es analizar una página web y crear una estructura COMPLETA de scraping extrayendo TODAS las propiedades visibles.
+
+SCHEMA DE SALIDA:
+${JSON.stringify(STRUCTURE_SCHEMA, null, 2)}
+
+INSTRUCCIONES:
+1. Analiza el HTML proporcionado de forma EXHAUSTIVA
+2. Identifica QUÉ TIPO DE OBJETO se repite en la página (artículos, productos, noticias, etc.)
+3. Identifica el CONTENEDOR CSS que se repite por cada resultado (result_container_selector)
+4. Extrae TODAS las propiedades visibles del objeto. Debes identificar MÍNIMO 5 propiedades por objeto.
+5. Para cada propiedad, crea una entrada en "properties_object_semantic_structure_schema" con:
+   - "type_schema": cómo extraer el dato:
+     * "string" → extrae textContent del elemento
+     * "url" → extrae el atributo href de un <a>
+     * "number" → extrae un número del textContent
+     * "date" → extrae un patrón de fecha/año del textContent
+     * "array" → extrae múltiples matches como array de strings
+     * "html" → extrae innerHTML
+   - "name_schema": nombre descriptivo de la propiedad (ej: title, authors, price, abstract)
+   - "selector_css_schema": selector CSS RELATIVO al contenedor del resultado
+6. Identifica la URL de búsqueda y los parámetros
+
+PROPIEDADES COMUNES POR TIPO DE SITIO (debes buscar TODAS estas y más):
+
+Para sitios ACADÉMICOS: title, url, authors, date, abstract, citations, journal, publisher, doi, volume
+Para sitios E-COMMERCE: name, url, price, rating, reviews_count, seller, brand, availability, description, shipping_info
+Para sitios de NOTICIAS: title, url, author, date, summary, category, source, image_alt
+Para BIBLIOTECAS/BASES DE DATOS: title, url, authors, year, venue, type, pages, doi, keywords
+
+EJEMPLO para un sitio académico (6 propiedades):
+{
+  "name": "Google Scholar",
+  "url": "https://scholar.google.com",
+  "domain": "academic",
+  "search_url": "https://scholar.google.com/scholar?q={query}",
+  "search_params": { "q": "query" },
+  "result_container_selector": ".gs_r.gs_or.gs_scl",
+  "object_semantic_structure_schema": { "type": "ArticleScientific" },
+  "properties_object_semantic_structure_schema": [
+    { "type_schema": "string", "name_schema": "title", "selector_css_schema": ".gs_rt" },
+    { "type_schema": "url", "name_schema": "url", "selector_css_schema": ".gs_rt a" },
+    { "type_schema": "string", "name_schema": "authors", "selector_css_schema": ".gs_a" },
+    { "type_schema": "date", "name_schema": "date", "selector_css_schema": ".gs_a" },
+    { "type_schema": "string", "name_schema": "abstract", "selector_css_schema": ".gs_rs" },
+    { "type_schema": "string", "name_schema": "citations", "selector_css_schema": ".gs_fl a" }
+  ]
+}
+
+EJEMPLO para e-commerce (7 propiedades):
+{
+  "name": "Amazon",
+  "url": "https://www.amazon.com",
+  "domain": "e-commerce",
+  "search_url": "https://www.amazon.com/s?k={query}",
+  "search_params": { "k": "query" },
+  "result_container_selector": "[data-component-type='s-search-result']",
+  "object_semantic_structure_schema": { "type": "Product" },
+  "properties_object_semantic_structure_schema": [
+    { "type_schema": "string", "name_schema": "name", "selector_css_schema": "h2 a span" },
+    { "type_schema": "url", "name_schema": "url", "selector_css_schema": "h2 a.a-link-normal" },
+    { "type_schema": "string", "name_schema": "price", "selector_css_schema": ".a-price .a-offscreen" },
+    { "type_schema": "string", "name_schema": "rating", "selector_css_schema": ".a-icon-alt" },
+    { "type_schema": "string", "name_schema": "reviews_count", "selector_css_schema": "a.s-underline-text span.a-size-base" },
+    { "type_schema": "string", "name_schema": "delivery", "selector_css_schema": ".a-color-base.a-text-bold" },
+    { "type_schema": "string", "name_schema": "brand", "selector_css_schema": ".a-size-base-plus.a-color-base" }
+  ]
+}
+
+REGLAS CRÍTICAS:
+- Debes encontrar MÍNIMO 5 propiedades. Si ves texto en la página, hay una propiedad para él
+- Analiza CADA elemento visible dentro del contenedor: títulos, precios, textos, links, badges, etc.
+- Los selectores CSS deben ser VÁLIDOS y lo más ESPECÍFICOS posible
+- Usa atributos data-* cuando existan (ej: [data-component-type='s-search-result'])
+- result_container_selector es el selector del elemento que se REPITE una vez por cada resultado
+- Los selectores de propiedades son RELATIVOS al contenedor (dentro de cada resultado)
 - search_url debe tener {query} donde va el término de búsqueda
 - Analiza la URL proporcionada para deducir search_url y search_params
-- Si el selector usa clases, prefiere clases específicas del sitio (no genéricas como "text" o "container")
-- Para citaciones, busca links o texto que contenga "Cited by", "Citado por", "citations", etc.
-- SIEMPRE responde con JSON válido, nada más`
+- Prefiere clases CSS específicas del sitio (no genéricas como "text" o "container")
+- El "type" en object_semantic_structure_schema debe reflejar QUÉ es el objeto (Article, Product, etc.)
+- SIEMPRE responde con JSON válido, nada más
+- NO incluyas el campo "properties_schema" en la respuesta, solo "properties_object_semantic_structure_schema"
+- Si hay precio, SIEMPRE inclúyelo. Si hay nombre/título, SIEMPRE inclúyelo. Si hay URL, SIEMPRE inclúyelo.`
 }

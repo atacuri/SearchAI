@@ -18,48 +18,50 @@ export interface ColorOption {
     value: string | null
 }
 
-// ============ Scraping Types ============
+// ============ Schema de Estructura (structureSearchAI.json) ============
 
 /**
- * Selectores CSS que la IA genera al analizar una página de resultados.
- * Estos permiten scrapear CUALQUIER sitio de forma genérica.
+ * Define una propiedad individual del objeto semántico.
+ * Cada propiedad tiene un tipo, un nombre y un selector CSS para extraerla.
+ * 
+ * type_schema: tipo de dato a extraer
+ *   - "string"  → extrae textContent
+ *   - "url"     → extrae atributo href del <a>
+ *   - "number"  → extrae número del textContent
+ *   - "date"    → extrae patrón de fecha/año del textContent
+ *   - "array"   → extrae múltiples matches como array de strings
+ *   - "html"    → extrae innerHTML
  */
-export interface SiteSelectors {
-    resultContainer: string   // Selector del contenedor de CADA resultado (se repite N veces)
-    title: string             // Selector del título dentro de cada resultado
-    titleLink: string         // Selector del link del título (para extraer href)
-    authors: string           // Selector del texto de autores
-    authorLinks: string       // Selector de los links de autores (si existen)
-    date: string              // Selector del elemento que contiene la fecha/año
-    abstract: string          // Selector del abstract/snippet
-    citations: string         // Selector del info de citaciones
+export interface PropertySchema {
+    type_schema: string
+    name_schema: string
+    selector_css_schema: string
 }
 
+/**
+ * Estructura genérica de un sitio — ya NO tiene selectores fijos.
+ * Las propiedades del objeto son dinámicas, definidas por la IA al analizar la página.
+ */
 export interface SiteStructure {
     name: string
     url: string
     domain: string
     search_url: string
     search_params: Record<string, string>
-    selectors: SiteSelectors
-    semantic_structure: {
+    result_container_selector: string  // Selector del contenedor que se repite por cada resultado
+    object_semantic_structure_schema: {
         type: string
     }
+    properties_object_semantic_structure_schema: PropertySchema[]
 }
 
-export interface ScrapedAuthor {
-    name: string
-    url: string
-}
+// ============ Resultados de Scraping (genéricos) ============
 
-export interface ScrapedArticle {
-    title: string
-    url: string
-    date: string
-    authors: ScrapedAuthor[]
-    citations: string
-    abstract: string
-}
+/**
+ * Un resultado individual extraído — las propiedades son dinámicas.
+ * Ejemplo: { title: "...", authors: "...", date: "2024", url: "https://..." }
+ */
+export type ScrapedItem = Record<string, any>
 
 export interface ScrapeResult {
     source: string
@@ -67,10 +69,13 @@ export interface ScrapeResult {
     url: string
     query: string
     totalResults: number
-    results: ScrapedArticle[]
+    results: ScrapedItem[]
     action: string
     semantic_type: string
+    properties: string[]  // Nombres de las propiedades extraídas (para renderizar)
 }
+
+// ============ Resultados de comandos ============
 
 export interface CreateStructureResult {
     action: 'createStructure'

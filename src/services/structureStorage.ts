@@ -1,12 +1,12 @@
 // src/services/structureStorage.ts
 // Servicio para almacenar y gestionar estructuras de sitios en chrome.storage.local
-// Las estructuras ahora usan SELECTORES CSS generados por IA
+// Las estructuras ahora usan PROPIEDADES DINÁMICAS generadas por IA
 
 import type { SiteStructure } from '../types'
 
 const STRUCTURES_KEY = 'site_structures'
 
-// Estructura por defecto de Google Scholar (con selectores CSS)
+// Estructura por defecto de Google Scholar (con propiedades dinámicas)
 const DEFAULT_STRUCTURES: SiteStructure[] = [
   {
     name: "Google Scholar",
@@ -14,19 +14,18 @@ const DEFAULT_STRUCTURES: SiteStructure[] = [
     domain: "academic",
     search_url: "https://scholar.google.com/scholar?q={query}",
     search_params: { q: "query" },
-    selectors: {
-      resultContainer: ".gs_r.gs_or.gs_scl",
-      title: ".gs_rt",
-      titleLink: ".gs_rt a",
-      authors: ".gs_a",
-      authorLinks: ".gs_a a",
-      date: ".gs_a",
-      abstract: ".gs_rs",
-      citations: ".gs_fl.gs_flb a"
-    },
-    semantic_structure: {
+    result_container_selector: ".gs_r.gs_or.gs_scl",
+    object_semantic_structure_schema: {
       type: "ArticleScientific"
-    }
+    },
+    properties_object_semantic_structure_schema: [
+      { type_schema: "string", name_schema: "title",     selector_css_schema: ".gs_rt" },
+      { type_schema: "url",    name_schema: "url",        selector_css_schema: ".gs_rt a" },
+      { type_schema: "string", name_schema: "authors",    selector_css_schema: ".gs_a" },
+      { type_schema: "date",   name_schema: "date",       selector_css_schema: ".gs_a" },
+      { type_schema: "string", name_schema: "abstract",   selector_css_schema: ".gs_rs" },
+      { type_schema: "string", name_schema: "citations",  selector_css_schema: ".gs_fl.gs_flb a" }
+    ]
   }
 ]
 
@@ -43,9 +42,62 @@ export async function getAllStructures(): Promise<SiteStructure[]> {
       await chrome.storage.local.set({ [STRUCTURES_KEY]: DEFAULT_STRUCTURES })
       return DEFAULT_STRUCTURES
     }
-    return stored as SiteStructure[]
+    // Migrar estructuras del formato viejo al nuevo si es necesario
+    const migrated = (stored as any[]).map(migrateStructure)
+    // Si hubo migración, guardar
+    const needsSave = (stored as any[]).some(s => s.selectors || s.semantic_structure)
+    if (needsSave) {
+      await chrome.storage.local.set({ [STRUCTURES_KEY]: migrated })
+    }
+    return migrated
   } catch {
     return DEFAULT_STRUCTURES
+  }
+}
+
+/**
+ * Migra una estructura del formato viejo (selectors) al nuevo (properties)
+ */
+function migrateStructure(s: any): SiteStructure {
+  // Si ya tiene el nuevo formato, devolverla tal cual
+  if (s.result_container_selector && s.object_semantic_structure_schema && s.properties_object_semantic_structure_schema) {
+    return s as SiteStructure
+  }
+
+  // Migrar formato viejo con "selectors" al nuevo con "properties"
+  if (s.selectors) {
+    const properties: any[] = []
+    const sel = s.selectors
+
+    if (sel.title)       properties.push({ type_schema: "string", name_schema: "title",     selector_css_schema: sel.title })
+    if (sel.titleLink)   properties.push({ type_schema: "url",    name_schema: "url",        selector_css_schema: sel.titleLink })
+    if (sel.authors)     properties.push({ type_schema: "string", name_schema: "authors",    selector_css_schema: sel.authors })
+    if (sel.date)        properties.push({ type_schema: "date",   name_schema: "date",       selector_css_schema: sel.date })
+    if (sel.abstract)    properties.push({ type_schema: "string", name_schema: "abstract",   selector_css_schema: sel.abstract })
+    if (sel.citations)   properties.push({ type_schema: "string", name_schema: "citations",  selector_css_schema: sel.citations })
+
+    return {
+      name: s.name || 'Sitio migrado',
+      url: s.url || '',
+      domain: s.domain || 'general',
+      search_url: s.search_url || '',
+      search_params: s.search_params || {},
+      result_container_selector: sel.resultContainer || '',
+      object_semantic_structure_schema: s.semantic_structure || { type: 'General' },
+      properties_object_semantic_structure_schema: properties
+    }
+  }
+
+  // Estructura irreconocible → devolver con valores por defecto
+  return {
+    name: s.name || 'Sitio desconocido',
+    url: s.url || '',
+    domain: s.domain || 'general',
+    search_url: s.search_url || '',
+    search_params: s.search_params || {},
+    result_container_selector: '',
+    object_semantic_structure_schema: s.semantic_structure || s.object_semantic_structure_schema || { type: 'General' },
+    properties_object_semantic_structure_schema: s.properties_object_semantic_structure_schema || []
   }
 }
 
