@@ -4,10 +4,32 @@
 // searchSiteVisible: abre la búsqueda en una pestaña nueva
 // createStructure: IA analiza el HTML y genera selectores CSS automáticamente
 
-import type { DSLCommand, SiteStructure, CreateStructureResult, ListStructuresResult } from '../types'
+import type {
+  DSLCommand,
+  SiteStructure,
+  CreateStructureResult,
+  ListStructuresResult,
+  ConditionEffect,
+  ListConditionCommandsResult,
+  ListScriptCommandsResult,
+  ScriptCommandPlan,
+  ScriptPlanStep
+} from '../types'
 import { scrapeCurrentPage, scrapeFromHtml, simplifyHtmlForAI } from '../services/scraperService'
 import { getStructureByName, buildSearchUrl, getAllStructures, saveStructure, deleteStructure } from '../services/structureStorage'
 import { getAIConfig } from '../services/aiService'
+import {
+  saveConditionCommand,
+  findConditionCommand,
+  getConditionCommands,
+  deleteConditionCommand
+} from '../services/conditionCommandStorage'
+import {
+  saveScriptCommand,
+  findScriptCommand,
+  getScriptCommands,
+  deleteScriptCommand
+} from '../services/scriptCommandStorage'
 
 export async function executePageCommand(command: DSLCommand): Promise<any> {
   switch (command.action) {
@@ -35,8 +57,45 @@ export async function executePageCommand(command: DSLCommand): Promise<any> {
     case 'deleteStructure':
       return await removeStructure(command.params.name)
 
+    case 'listConditionCommands':
+      return await listConditionCommands()
+
+    case 'deleteConditionCommand':
+      return await removeConditionCommand(command.params.name)
+
+    case 'createScriptCommand':
+      return await createScriptCommand(
+        command.params.name,
+        command.params.description,
+        command.params.triggers
+      )
+
+    case 'runScriptCommand':
+      return await runScriptCommand(command.params.name)
+
+    case 'listScriptCommands':
+      return await listScriptCommands()
+
+    case 'deleteScriptCommand':
+      return await removeScriptCommand(command.params.name)
+
     case 'highlightByCondition':
       return await highlightByCondition(
+        command.params.property,
+        command.params.operator,
+        command.params.value
+      )
+
+    case 'createConditionCommand':
+      return await createConditionCommand(
+        command.params.name,
+        command.params.effect || command.params.operation || command.params.behavior,
+        command.params.triggers
+      )
+
+    case 'runConditionCommand':
+      return await runConditionCommand(
+        command.params.name,
         command.params.property,
         command.params.operator,
         command.params.value
@@ -56,6 +115,24 @@ async function listStructures(): Promise<ListStructuresResult> {
     action: 'listStructures',
     structures,
     total: structures.length
+  }
+}
+
+async function listConditionCommands(): Promise<ListConditionCommandsResult> {
+  const commands = await getConditionCommands()
+  return {
+    action: 'listConditionCommands',
+    commands,
+    total: commands.length
+  }
+}
+
+async function listScriptCommands(): Promise<ListScriptCommandsResult> {
+  const commands = await getScriptCommands()
+  return {
+    action: 'listScriptCommands',
+    commands,
+    total: commands.length
   }
 }
 
@@ -80,6 +157,142 @@ async function removeStructure(name: string): Promise<any> {
     success: true,
     name: structure.name,
     message: `Estructura "${structure.name}" eliminada correctamente.`
+  }
+}
+
+async function removeConditionCommand(name: string): Promise<any> {
+  if (!name) {
+    throw new Error('Se necesita el nombre del comando a eliminar. Ejemplo: "elimina comando eliminar"')
+  }
+
+  const exists = await findConditionCommand(name)
+  if (!exists) {
+    const all = await getConditionCommands()
+    const names = all.map((c) => c.name).join(', ')
+    throw new Error(`No se encontró el comando "${name}". Comandos disponibles: ${names || 'ninguno'}`)
+  }
+
+  const deleted = await deleteConditionCommand(exists.name)
+  if (!deleted) {
+    throw new Error(`No se pudo eliminar el comando "${exists.name}".`)
+  }
+
+  return {
+    action: 'deleteConditionCommand',
+    success: true,
+    name: exists.name,
+    message: `Comando "${exists.name}" eliminado correctamente.`
+  }
+}
+
+async function createScriptCommand(
+  name: string,
+  description: string,
+  triggers: string[] = []
+): Promise<any> {
+  const finalDescription = String(description || name || '').trim()
+  if (!finalDescription) {
+    throw new Error('Describe qué debe hacer el comando. Ejemplo: "crear popup con los elementos".')
+  }
+
+  const aiConfig = await getAIConfig()
+  if (!aiConfig || !aiConfig.apiKey) {
+    throw new Error('Necesitas configurar tu API key de IA para generar comandos JavaScript.')
+  }
+
+  const commandName = String(name || inferCommandName(finalDescription)).trim()
+  if (!commandName) {
+    throw new Error('No se pudo inferir el nombre del comando. Indica uno explícitamente.')
+  }
+
+  const response = await chrome.runtime.sendMessage({
+    type: 'AI_GENERATE_SCRIPT_COMMAND',
+    description: finalDescription,
+    commandName,
+    provider: aiConfig.provider,
+    apiKey: aiConfig.apiKey,
+    model: aiConfig.model
+  })
+
+  if (!response || !response.success || !response.script?.code) {
+    throw new Error(response?.error || 'No se pudo generar el código JavaScript del comando.')
+  }
+
+  const saved = await saveScriptCommand({
+    name: response.script.name || commandName,
+    description: finalDescription,
+    code: String(response.script.code),
+    plan: response.script.plan,
+    triggers: Array.isArray(response.script.triggers) ? response.script.triggers : triggers
+  })
+
+  return {
+    action: 'createScriptCommand',
+    success: true,
+    command: saved,
+    code: saved.code,
+    message: `Comando JavaScript "${saved.name}" creado y guardado.`
+  }
+}
+
+async function runScriptCommand(name: string): Promise<any> {
+  if (!name || !String(name).trim()) {
+    throw new Error('Falta el nombre del comando JavaScript a ejecutar.')
+  }
+
+  const command = await findScriptCommand(name)
+  if (!command) {
+    const all = await getScriptCommands()
+    const names = all.map((c) => c.name).join(', ')
+    throw new Error(`No existe el comando "${name}". Comandos disponibles: ${names || 'ninguno'}`)
+  }
+
+  const structure = await resolveStructureByUrl(window.location.href)
+  const elements = structure
+    ? (Array.from(document.querySelectorAll(structure.result_container_selector)) as HTMLElement[])
+    : []
+
+  if (!command.plan || !Array.isArray(command.plan.steps) || command.plan.steps.length === 0) {
+    throw new Error(
+      `El comando "${command.name}" no tiene plan ejecutable. ` +
+      'Recréalo para que se ejecute sin unsafe-eval (CSP de extensiones MV3).'
+    )
+  }
+
+  const result = executeScriptPlan(command.plan, elements)
+
+  return {
+    action: 'runScriptCommand',
+    success: true,
+    commandName: command.name,
+    message: result?.message || `Comando "${command.name}" ejecutado.`,
+    result,
+    totalElements: elements.length
+  }
+}
+
+async function removeScriptCommand(name: string): Promise<any> {
+  if (!name || !String(name).trim()) {
+    throw new Error('Se necesita el nombre del comando JavaScript a eliminar.')
+  }
+
+  const exists = await findScriptCommand(name)
+  if (!exists) {
+    const all = await getScriptCommands()
+    const names = all.map((c) => c.name).join(', ')
+    throw new Error(`No se encontró el comando "${name}". Disponibles: ${names || 'ninguno'}`)
+  }
+
+  const deleted = await deleteScriptCommand(exists.name)
+  if (!deleted) {
+    throw new Error(`No se pudo eliminar el comando "${exists.name}".`)
+  }
+
+  return {
+    action: 'deleteScriptCommand',
+    success: true,
+    name: exists.name,
+    message: `Comando JavaScript "${exists.name}" eliminado correctamente.`
   }
 }
 
@@ -373,6 +586,77 @@ async function highlightByCondition(
   operator: string = '>',
   value: any = 0
 ): Promise<any> {
+  return await applyConditionAction(property, operator, value, 'highlight', 'highlightByCondition')
+}
+
+async function createConditionCommand(
+  name: string,
+  effect: string,
+  triggers: string[] = []
+): Promise<any> {
+  if (!name || !String(name).trim()) {
+    throw new Error('Indica el nombre del comando. Ejemplo: "crear comando eliminar".')
+  }
+
+  const saved = await saveConditionCommand({
+    name: String(name).trim(),
+    effect: normalizeConditionEffect(effect || name),
+    triggers
+  })
+
+  const actionLabel = effectLabel(saved.effect)
+  return {
+    action: 'createConditionCommand',
+    success: true,
+    command: saved,
+    message:
+      `Comando "${saved.name}" guardado. Acción: ${actionLabel}. ` +
+      `Ahora puedes usar frases como "${saved.name} los que tienen menos de 5 citas".`
+  }
+}
+
+async function runConditionCommand(
+  name: string,
+  property: string,
+  operator: string = '>',
+  value: any = 0
+): Promise<any> {
+  if (!name || !String(name).trim()) {
+    throw new Error('Falta el nombre del comando personalizado a ejecutar.')
+  }
+
+  const command = await findConditionCommand(name)
+  if (!command) {
+    const available = await getConditionCommands()
+    const names = available.map((c) => c.name).join(', ')
+    throw new Error(
+      `No existe el comando "${name}". ` +
+      `Comandos disponibles: ${names || 'ninguno'}.`
+    )
+  }
+
+  return await applyConditionAction(
+    property,
+    operator,
+    value,
+    command.effect,
+    'runConditionCommand',
+    command.name
+  )
+}
+
+async function applyConditionAction(
+  property: string,
+  operator: string = '>',
+  value: any = 0,
+  effect: ConditionEffect = 'highlight',
+  action: 'highlightByCondition' | 'runConditionCommand' = 'highlightByCondition',
+  commandName?: string
+): Promise<any> {
+  if (!property) {
+    throw new Error('Falta la propiedad para filtrar. Ejemplo: citas, precio o año.')
+  }
+
   const structure = await resolveStructureByUrl(window.location.href)
   if (!structure) {
     throw new Error('No hay estructura para este sitio. Abre resultados del sitio y usa "crear estructura".')
@@ -393,9 +677,11 @@ async function highlightByCondition(
     throw new Error(`No se encontraron resultados con selector "${structure.result_container_selector}".`)
   }
 
-  clearHighlights()
+  if (effect === 'highlight') {
+    clearHighlights()
+  }
 
-  let highlighted = 0
+  let affected = 0
   containers.forEach((container) => {
     const extracted = extractValueBySchema(
       container,
@@ -404,20 +690,37 @@ async function highlightByCondition(
       propSchema.name_schema
     )
     if (matchesCondition(extracted, operator, value)) {
-      applyHighlight(container)
-      highlighted++
+      if (effect === 'remove') {
+        container.remove()
+      } else if (effect === 'hide') {
+        hideContainer(container)
+      } else {
+        applyHighlight(container)
+      }
+      affected++
     }
   })
 
+  const total = containers.length
+  const effectText = effectLabel(effect)
+  const conditionText = `${propSchema.name_schema} ${operator} ${value}`
+  const message =
+    effect === 'highlight'
+      ? `Se resaltaron ${affected} de ${total} resultados donde ${conditionText}.`
+      : `Se aplicó "${effectText}" en ${affected} de ${total} resultados donde ${conditionText}.`
+
   return {
-    action: 'highlightByCondition',
+    action,
     success: true,
+    commandName,
+    effect,
     property: propSchema.name_schema,
     operator,
     value,
-    total: containers.length,
-    highlighted,
-    message: `Se resaltaron ${highlighted} de ${containers.length} resultados donde ${propSchema.name_schema} ${operator} ${value}.`
+    total,
+    affected,
+    highlighted: effect === 'highlight' ? affected : 0,
+    message
   }
 }
 
@@ -582,6 +885,150 @@ function applyHighlight(element: HTMLElement) {
   element.style.background = 'rgba(245, 158, 11, 0.12)'
   element.style.boxShadow = '0 0 0 2px rgba(245, 158, 11, 0.2) inset'
   element.style.borderRadius = '8px'
+}
+
+function hideContainer(element: HTMLElement) {
+  element.setAttribute('data-ai-hidden', '1')
+  element.style.display = 'none'
+}
+
+function effectLabel(effect: ConditionEffect): string {
+  if (effect === 'remove') return 'eliminar'
+  if (effect === 'hide') return 'ocultar'
+  return 'resaltar'
+}
+
+function normalizeConditionEffect(value: string): ConditionEffect {
+  const normalized = normalizeKey(value || '')
+  if (['remove', 'delete', 'eliminar', 'borrar', 'quitar'].some((word) => normalized.includes(word))) {
+    return 'remove'
+  }
+  if (['hide', 'ocultar', 'esconder'].some((word) => normalized.includes(word))) {
+    return 'hide'
+  }
+  return 'highlight'
+}
+
+function inferCommandName(description: string): string {
+  const cleaned = String(description || '')
+    .toLowerCase()
+    .replace(/quiero un comando(?: que)?/g, '')
+    .replace(/crear|cree|crea|haga|hace/g, '')
+    .trim()
+  if (!cleaned) return ''
+  return cleaned.length > 40 ? cleaned.slice(0, 40).trim() : cleaned
+}
+
+function executeScriptPlan(plan: ScriptCommandPlan, elements: HTMLElement[]) {
+  const messages: string[] = []
+  let lastResult: any = { success: true, message: 'Plan ejecutado.' }
+
+  for (const step of plan.steps || []) {
+    lastResult = executeScriptStep(step, elements)
+    if (lastResult?.message) messages.push(String(lastResult.message))
+  }
+
+  return {
+    success: true,
+    message: messages.join(' | ') || 'Comando ejecutado.',
+    steps: plan.steps?.length || 0,
+    details: lastResult
+  }
+}
+
+function executeScriptStep(step: ScriptPlanStep, elements: HTMLElement[]) {
+  const type = String(step?.type || '')
+
+  if (type === 'popup_elements') {
+    return showElementsPopup(elements, step.title || 'Elementos', step.maxItems || 30, step.maxChars || 120)
+  }
+
+  if (type === 'highlight_elements') {
+    elements.forEach((el) => applyHighlight(el))
+    return { success: true, message: `Se resaltaron ${elements.length} elementos.` }
+  }
+
+  if (type === 'hide_elements') {
+    elements.forEach((el) => hideContainer(el))
+    return { success: true, message: `Se ocultaron ${elements.length} elementos.` }
+  }
+
+  if (type === 'remove_elements') {
+    elements.forEach((el) => el.remove())
+    return { success: true, message: `Se eliminaron ${elements.length} elementos.` }
+  }
+
+  if (type === 'console_log') {
+    console.log('[ScriptCommand] elementos', elements)
+    return { success: true, message: `Se enviaron ${elements.length} elementos a la consola.` }
+  }
+
+  return { success: true, message: `Paso "${type}" ignorado (no soportado).` }
+}
+
+function showElementsPopup(elements: HTMLElement[], title: string, maxItems: number, maxChars: number) {
+  const existing = document.getElementById('ai-script-command-popup')
+  if (existing) existing.remove()
+
+  const popup = document.createElement('div')
+  popup.id = 'ai-script-command-popup'
+  popup.style.position = 'fixed'
+  popup.style.top = '20px'
+  popup.style.right = '20px'
+  popup.style.zIndex = '2147483647'
+  popup.style.background = '#ffffff'
+  popup.style.border = '1px solid #d1d5db'
+  popup.style.borderRadius = '8px'
+  popup.style.boxShadow = '0 8px 24px rgba(0,0,0,0.18)'
+  popup.style.padding = '12px'
+  popup.style.width = '360px'
+  popup.style.maxHeight = '60vh'
+  popup.style.overflow = 'auto'
+  popup.style.fontFamily = 'system-ui, -apple-system, Segoe UI, sans-serif'
+
+  const header = document.createElement('div')
+  header.style.display = 'flex'
+  header.style.justifyContent = 'space-between'
+  header.style.alignItems = 'center'
+  header.style.marginBottom = '8px'
+
+  const h = document.createElement('strong')
+  h.textContent = `${title} (${elements.length})`
+  h.style.fontSize = '13px'
+  h.style.color = '#111827'
+
+  const close = document.createElement('button')
+  close.textContent = '×'
+  close.style.border = 'none'
+  close.style.background = 'transparent'
+  close.style.cursor = 'pointer'
+  close.style.fontSize = '18px'
+  close.style.lineHeight = '1'
+  close.onclick = () => popup.remove()
+
+  header.appendChild(h)
+  header.appendChild(close)
+  popup.appendChild(header)
+
+  const list = document.createElement('div')
+  const safeMaxItems = Math.max(1, Math.min(maxItems || 30, 200))
+  const safeMaxChars = Math.max(20, Math.min(maxChars || 120, 600))
+
+  elements.slice(0, safeMaxItems).forEach((el, idx) => {
+    const row = document.createElement('div')
+    row.style.fontSize = '12px'
+    row.style.color = '#374151'
+    row.style.padding = '4px 0'
+    row.style.borderBottom = '1px solid #f3f4f6'
+    const text = (el.textContent || '').trim().replace(/\s+/g, ' ')
+    row.textContent = `${idx + 1}. ${text.slice(0, safeMaxChars)}`
+    list.appendChild(row)
+  })
+
+  popup.appendChild(list)
+  document.body.appendChild(popup)
+
+  return { success: true, message: `Popup creado con ${Math.min(elements.length, safeMaxItems)} elementos.` }
 }
 
 function changeColor(color: string | null) {

@@ -3,7 +3,19 @@
 
 import { useState, useRef, useEffect } from "react"
 import type { PlasmoCSConfig, PlasmoGetStyle } from "plasmo"
-import type { DSLCommand, ScrapeResult, ScrapedItem, CreateStructureResult, ListStructuresResult, SiteStructure, PropertySchema } from "./types"
+import type {
+  DSLCommand,
+  ScrapeResult,
+  ScrapedItem,
+  CreateStructureResult,
+  ListStructuresResult,
+  ListConditionCommandsResult,
+  ListScriptCommandsResult,
+  SiteStructure,
+  PropertySchema,
+  ConditionCommandDefinition,
+  ScriptCommandDefinition
+} from "./types"
 import { parseWithAI, isAIConfigured } from "./dsl/aiParser"
 import { executePageCommand } from "./dsl/pageExecutor"
 import { getAIConfig, saveAIConfig, clearAIConfig, type AIConfig } from "./services/aiService"
@@ -1167,6 +1179,16 @@ function FloatingPrompt() {
                 }>
                 📂 Ver sitios
               </button>
+              <button
+                className="quick-btn list-btn"
+                onClick={() =>
+                  executeQuickAction({
+                    action: "listScriptCommands",
+                    params: {}
+                  })
+                }>
+                🧩 Ver comandos
+              </button>
             </div>
 
             {loading && (
@@ -1189,6 +1211,22 @@ function FloatingPrompt() {
             */}
 
             {result && result.action === "deleteStructure" && (
+              <div className="result-area">
+                <div className="result-success">
+                  🗑️ {result.message}
+                </div>
+              </div>
+            )}
+
+            {result && result.action === "deleteConditionCommand" && (
+              <div className="result-area">
+                <div className="result-success">
+                  🗑️ {result.message}
+                </div>
+              </div>
+            )}
+
+            {result && result.action === "deleteScriptCommand" && (
               <div className="result-area">
                 <div className="result-success">
                   🗑️ {result.message}
@@ -1270,6 +1308,116 @@ function FloatingPrompt() {
               </div>
             )}
 
+            {result && result.action === "listConditionCommands" && (
+              <div className="result-area">
+                <div className="result-list-structures">
+                  <div className="list-structures-header">
+                    <h4>🧩 Comandos personalizados ({(result as ListConditionCommandsResult).total})</h4>
+                  </div>
+
+                  {(result as ListConditionCommandsResult).commands.length === 0 ? (
+                    <div className="no-structures">
+                      No hay comandos personalizados guardados. Ej: "quiero un comando para eliminar elementos".
+                    </div>
+                  ) : (
+                    (result as ListConditionCommandsResult).commands.map((cmd: ConditionCommandDefinition, i: number) => (
+                      <div key={`cmd-${i}`} className="structure-card">
+                        <div className="structure-card-header">
+                          <span className="structure-card-name">{cmd.name}</span>
+                          <div style={{ display: 'flex', gap: '4px', alignItems: 'center' }}>
+                            <span className="structure-card-badge">
+                              {cmd.effect === 'remove' ? 'eliminar' : cmd.effect === 'hide' ? 'ocultar' : 'resaltar'}
+                            </span>
+                            <button
+                              className="delete-structure-btn"
+                              onClick={() =>
+                                executeQuickAction({
+                                  action: "deleteConditionCommand",
+                                  params: { name: cmd.name }
+                                })
+                              }>
+                              ✕
+                            </button>
+                          </div>
+                        </div>
+
+                        <div className="structure-card-info">
+                          <span className="info-label">🎯 Acción:</span>
+                          <span className="info-value">
+                            {cmd.effect === 'remove' ? 'eliminar' : cmd.effect === 'hide' ? 'ocultar' : 'resaltar'}
+                          </span>
+
+                          <span className="info-label">🗣️ Triggers:</span>
+                          <span className="info-value">
+                            {(cmd.triggers || []).join(', ') || cmd.name}
+                          </span>
+
+                          <span className="info-label">🕒 Creado:</span>
+                          <span className="info-value">
+                            {new Date(cmd.createdAt).toLocaleString()}
+                          </span>
+                        </div>
+                      </div>
+                    ))
+                  )}
+                </div>
+              </div>
+            )}
+
+            {result && result.action === "listScriptCommands" && (
+              <div className="result-area">
+                <div className="result-list-structures">
+                  <div className="list-structures-header">
+                    <h4>🧩 Comandos JavaScript ({(result as ListScriptCommandsResult).total})</h4>
+                  </div>
+
+                  {(result as ListScriptCommandsResult).commands.length === 0 ? (
+                    <div className="no-structures">
+                      No hay comandos JavaScript guardados. Ej: "quiero un comando que cree un popup con los elementos".
+                    </div>
+                  ) : (
+                    (result as ListScriptCommandsResult).commands.map((cmd: ScriptCommandDefinition, i: number) => (
+                      <div key={`scmd-${i}`} className="structure-card">
+                        <div className="structure-card-header">
+                          <span className="structure-card-name">{cmd.name}</span>
+                          <div style={{ display: 'flex', gap: '4px', alignItems: 'center' }}>
+                            <span className="structure-card-badge">script</span>
+                            <button
+                              className="delete-structure-btn"
+                              onClick={() =>
+                                executeQuickAction({
+                                  action: "deleteScriptCommand",
+                                  params: { name: cmd.name }
+                                })
+                              }>
+                              ✕
+                            </button>
+                          </div>
+                        </div>
+
+                        <div className="structure-card-info">
+                          <span className="info-label">📝 Descripción:</span>
+                          <span className="info-value">{cmd.description || '(sin descripción)'}</span>
+
+                          <span className="info-label">🗣️ Triggers:</span>
+                          <span className="info-value">{(cmd.triggers || []).join(', ') || cmd.name}</span>
+                        </div>
+
+                        <div className="structure-card-selectors" style={{ display: 'block', marginTop: '8px' }}>
+                          <div className="sel-row">
+                            <span className="sel-name">code:</span>
+                            <span className="sel-value" style={{ whiteSpace: 'pre-wrap' }}>
+                              {cmd.code}
+                            </span>
+                          </div>
+                        </div>
+                      </div>
+                    ))
+                  )}
+                </div>
+              </div>
+            )}
+
             {result && result.action === "createStructure" && (
               <div className="result-area">
                 <div className="result-structure">
@@ -1338,6 +1486,46 @@ function FloatingPrompt() {
               <div className="result-area">
                 <div className="result-success">
                   ✨ {result.message}
+                </div>
+              </div>
+            )}
+
+            {result && result.action === "createConditionCommand" && (
+              <div className="result-area">
+                <div className="result-success">
+                  🧩 {result.message}
+                </div>
+              </div>
+            )}
+
+            {result && result.action === "createScriptCommand" && (
+              <div className="result-area">
+                <div className="result-success">
+                  🧩 {result.message}
+                </div>
+                <div className="result-scrape" style={{ marginTop: '8px' }}>
+                  <div className="scrape-header">
+                    <h4>🧾 Código JavaScript generado</h4>
+                  </div>
+                  <div className="json-view" style={{ marginTop: 0 }}>
+                    <pre>{String(result.code || result.command?.code || '')}</pre>
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {result && result.action === "runConditionCommand" && (
+              <div className="result-area">
+                <div className="result-success">
+                  ⚡ {result.message}
+                </div>
+              </div>
+            )}
+
+            {result && result.action === "runScriptCommand" && (
+              <div className="result-area">
+                <div className="result-success">
+                  ⚡ {result.message}
                 </div>
               </div>
             )}
@@ -1444,6 +1632,8 @@ function FloatingPrompt() {
               Ej highlight: "resalta artículos con más de 100 citas"
               <br />
               📂 "ver sitios" para listar las estructuras guardadas.
+              <br />
+              🧩 "ver comandos" para listar y borrar comandos personalizados.
             </div>
           </div>
         </div>

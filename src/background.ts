@@ -3,6 +3,9 @@
 // En MV3, solo el background tiene acceso cross-origin con host_permissions
 
 import { PREDEFINED_COLORS } from "./utils/colorUtils"
+import { getConditionCommands } from "./services/conditionCommandStorage"
+import { getScriptCommands } from "./services/scriptCommandStorage"
+import type { ConditionCommandDefinition, ScriptCommandDefinition } from "./types"
 
 // ============ Tipos de mensajes ============
 
@@ -19,6 +22,15 @@ interface AIAnalyzePageRequest {
   html: string
   url: string
   pageTitle: string
+  provider: "groq" | "openai" | "anthropic" | "google"
+  apiKey: string
+  model?: string
+}
+
+interface AIGenerateScriptCommandRequest {
+  type: "AI_GENERATE_SCRIPT_COMMAND"
+  description: string
+  commandName: string
   provider: "groq" | "openai" | "anthropic" | "google"
   apiKey: string
   model?: string
@@ -59,7 +71,12 @@ interface OpenTabResponse {
   error?: string
 }
 
-type MessageRequest = AIRequest | AIAnalyzePageRequest | FetchPageRequest | OpenTabRequest
+type MessageRequest =
+  | AIRequest
+  | AIAnalyzePageRequest
+  | AIGenerateScriptCommandRequest
+  | FetchPageRequest
+  | OpenTabRequest
 
 // ============ Listener principal ============
 
@@ -84,6 +101,18 @@ chrome.runtime.onMessage.addListener(
           sendResponse({
             success: false,
             error: err.message || "Error al analizar la página"
+          })
+        })
+      return true
+    }
+
+    if (message.type === "AI_GENERATE_SCRIPT_COMMAND") {
+      handleGenerateScriptCommand(message as AIGenerateScriptCommandRequest)
+        .then(sendResponse)
+        .catch((err) => {
+          sendResponse({
+            success: false,
+            error: err.message || "Error al generar comando JavaScript"
           })
         })
       return true
@@ -173,20 +202,22 @@ async function handleAIRequest(request: AIRequest): Promise<AIResponse> {
   const { input, provider, apiKey, model } = request
 
   try {
+    const customCommands = await getConditionCommands()
+    const scriptCommands = await getScriptCommands()
     let command = null
 
     switch (provider) {
       case "groq":
-        command = await callAI(provider, apiKey, model || "llama-3.1-8b-instant", buildDSLPrompt(), input)
+        command = await callAI(provider, apiKey, model || "llama-3.1-8b-instant", buildDSLPrompt(customCommands, scriptCommands), input)
         break
       case "openai":
-        command = await callAI(provider, apiKey, model || "gpt-4o-mini", buildDSLPrompt(), input)
+        command = await callAI(provider, apiKey, model || "gpt-4o-mini", buildDSLPrompt(customCommands, scriptCommands), input)
         break
       case "anthropic":
-        command = await callAI(provider, apiKey, model || "claude-3-haiku-20240307", buildDSLPrompt(), input)
+        command = await callAI(provider, apiKey, model || "claude-3-haiku-20240307", buildDSLPrompt(customCommands, scriptCommands), input)
         break
       case "google":
-        command = await callAI(provider, apiKey, model || "gemini-2.0-flash", buildDSLPrompt(), input)
+        command = await callAI(provider, apiKey, model || "gemini-2.0-flash", buildDSLPrompt(customCommands, scriptCommands), input)
         break
       default:
         return { success: false, error: `Proveedor no soportado: ${provider}` }
@@ -196,6 +227,60 @@ async function handleAIRequest(request: AIRequest): Promise<AIResponse> {
   } catch (error: any) {
     console.error("[Background] Error al parsear con IA:", error)
     return { success: false, error: error.message || "Error al comunicarse con la IA" }
+  }
+}
+
+async function handleGenerateScriptCommand(
+  request: AIGenerateScriptCommandRequest
+): Promise<{ success: boolean; script?: any; error?: string }> {
+  const { provider, apiKey, model, description, commandName } = request
+
+  try {
+    const result = await callAI(
+      provider,
+      apiKey,
+      model ||
+        (provider === "groq"
+          ? "llama-3.1-8b-instant"
+          : provider === "openai"
+            ? "gpt-4o-mini"
+            : provider === "anthropic"
+              ? "claude-3-haiku-20240307"
+              : "gemini-2.0-flash"),
+      buildScriptGeneratorPrompt(),
+      `Nombre del comando: ${commandName}\nDescripción del comando: ${description}`
+    )
+
+    if (!result || !result.code) {
+      return { success: false, error: "La IA no devolvió código para el comando." }
+    }
+
+    const plan =
+      result.plan && Array.isArray(result.plan.steps) && result.plan.steps.length > 0
+        ? result.plan
+        : {
+            steps: [
+              {
+                type: "popup_elements",
+                title: "Elementos",
+                maxItems: 30,
+                maxChars: 120
+              }
+            ]
+          }
+
+    return {
+      success: true,
+      script: {
+        name: result.name || commandName,
+        description,
+        triggers: Array.isArray(result.triggers) ? result.triggers : [commandName],
+        code: String(result.code),
+        plan
+      }
+    }
+  } catch (error: any) {
+    return { success: false, error: error.message || "Error generando comando JavaScript" }
   }
 }
 
@@ -401,10 +486,33 @@ async function callGemini(
 
 // ============ System Prompt: Parseo de comandos DSL ============
 
-function buildDSLPrompt(): string {
+function buildDSLPrompt(
+  customCommands: ConditionCommandDefinition[] = [],
+  scriptCommands: ScriptCommandDefinition[] = []
+): string {
   const colorsList = PREDEFINED_COLORS.filter((c) => c.value !== null)
     .map((c) => `- ${c.name}: ${c.value}`)
     .join("\n")
+
+  const customCommandsList =
+    customCommands.length > 0
+      ? customCommands
+          .map((command) => {
+            const triggers = command.triggers?.length ? ` | triggers: ${command.triggers.join(", ")}` : ""
+            return `- ${command.name} → ${command.effect}${triggers}`
+          })
+          .join("\n")
+      : "- (ninguno)"
+
+  const scriptCommandsList =
+    scriptCommands.length > 0
+      ? scriptCommands
+          .map((command) => {
+            const triggers = command.triggers?.length ? ` | triggers: ${command.triggers.join(", ")}` : ""
+            return `- ${command.name}${triggers}`
+          })
+          .join("\n")
+      : "- (ninguno)"
 
   return `Eres un parser que convierte lenguaje natural en español a comandos DSL (Domain Specific Language).
 
@@ -455,6 +563,46 @@ ${colorsList}
    - "value" es el valor a comparar
    - Ejemplos: "resalta artículos con más de 100 citas", "resaltar productos con precio mayor a 500", "marca resultados con year >= 2020"
 
+10. createConditionCommand: Crea un comando personalizado basado en condición y lo guarda
+   - Parámetros: { "name": string, "effect": "highlight" | "hide" | "remove", "triggers": string[] }
+   - "name" es el nombre del comando (ej: "eliminar", "ocultar")
+   - "effect" define qué hacer con los resultados que cumplan la condición
+   - Ejemplo: "quiero un comando para eliminar elementos" -> { "action": "createConditionCommand", "params": { "name": "eliminar", "effect": "remove", "triggers": ["eliminar"] } }
+
+11. runConditionCommand: Ejecuta un comando personalizado por condición
+   - Parámetros: { "name": string, "property": string, "operator": string, "value": number|string }
+   - Ejemplo: "eliminar los que tienen menos de 5 citas" -> { "action": "runConditionCommand", "params": { "name": "eliminar", "property": "citations", "operator": "<", "value": 5 } }
+
+12. listConditionCommands: Lista los comandos personalizados guardados
+   - Parámetros: {}
+   - Ejemplos: "ver comandos", "listar comandos", "mostrar comandos personalizados"
+
+13. deleteConditionCommand: Elimina un comando personalizado por nombre
+   - Parámetros: { "name": string }
+   - Ejemplos: "eliminar comando eliminar", "borra el comando ocultar"
+
+14. createScriptCommand: Crea un comando personalizado cuyo cuerpo es código JavaScript generado por IA
+   - Parámetros: { "name": string, "description": string, "triggers": string[] }
+   - Ejemplo: "quiero un comando que cree un popup con los elementos" -> { "action": "createScriptCommand", "params": { "name": "popup elementos", "description": "crear popup con los elementos", "triggers": ["popup", "mostrar elementos"] } }
+
+15. runScriptCommand: Ejecuta un comando JavaScript guardado sobre los elementos de resultados
+   - Parámetros: { "name": string }
+   - Ejemplo: "ejecuta popup elementos" -> { "action": "runScriptCommand", "params": { "name": "popup elementos" } }
+
+16. listScriptCommands: Lista los comandos JavaScript guardados
+   - Parámetros: {}
+   - Ejemplos: "ver comandos", "listar comandos javascript"
+
+17. deleteScriptCommand: Elimina un comando JavaScript guardado por nombre
+   - Parámetros: { "name": string }
+   - Ejemplos: "elimina comando popup elementos", "borra comando popup"
+
+COMANDOS PERSONALIZADOS DISPONIBLES (priorizar estos cuando aplique):
+${customCommandsList}
+
+COMANDOS JAVASCRIPT DISPONIBLES (priorizar runScriptCommand cuando aplique):
+${scriptCommandsList}
+
 INSTRUCCIONES:
 - Responde SOLO con un objeto JSON válido
 - Formatos:
@@ -467,6 +615,14 @@ INSTRUCCIONES:
   { "action": "listStructures", "params": {} }
   { "action": "deleteStructure", "params": { "name": "DBLP" } }
   { "action": "highlightByCondition", "params": { "property": "citations", "operator": ">", "value": 100 } }
+  { "action": "createConditionCommand", "params": { "name": "eliminar", "effect": "remove", "triggers": ["eliminar"] } }
+  { "action": "runConditionCommand", "params": { "name": "eliminar", "property": "citations", "operator": "<", "value": 5 } }
+  { "action": "listConditionCommands", "params": {} }
+  { "action": "deleteConditionCommand", "params": { "name": "eliminar" } }
+  { "action": "createScriptCommand", "params": { "name": "popup elementos", "description": "crear popup con los elementos", "triggers": ["popup elementos"] } }
+  { "action": "runScriptCommand", "params": { "name": "popup elementos" } }
+  { "action": "listScriptCommands", "params": {} }
+  { "action": "deleteScriptCommand", "params": { "name": "popup elementos" } }
 - Si no entiendes el comando: { "action": null, "params": {} }
 - Por defecto, para frases tipo "en [sitio] busca [query]": usa searchSiteVisible
 - Si el usuario pide "invisible", "en segundo plano", "sin abrir pestaña": usa searchSite (modo invisible + extracción)
@@ -475,7 +631,61 @@ INSTRUCCIONES:
 - Para ver las estructuras guardadas: usa listStructures
 - Para eliminar una estructura: usa deleteStructure
 - Para resaltar resultados por condición en la página actual: usa highlightByCondition
+- Si el usuario pide "crear comando" o "quiero un comando para ...": usa createConditionCommand
+- Si la frase empieza con un comando personalizado disponible: usa runConditionCommand y extrae la condición (property/operator/value)
+- Si el usuario pide ver/listar comandos personalizados: usa listConditionCommands
+- Si el usuario pide borrar/eliminar un comando personalizado: usa deleteConditionCommand
+- Si el usuario pide "quiero un comando...": usa createScriptCommand
+- Si la frase corresponde a un comando JavaScript guardado: usa runScriptCommand
+- Si el usuario pide ver/listar comandos: usa listScriptCommands
+- Si el usuario pide borrar/eliminar un comando JavaScript: usa deleteScriptCommand
+- Mapea efectos así: "eliminar/borrar/quitar" => remove, "ocultar/esconder" => hide, "resaltar/marcar" => highlight
+- Mapea comparaciones así: "más de" => ">", "menos de" => "<", "al menos" => ">=", "como máximo" => "<=", "igual a" => "="
 - "scholar" = "Google Scholar", "springer" = "Springer", "dblp" = "DBLP"`
+}
+
+function buildScriptGeneratorPrompt(): string {
+  return `Eres un generador de comandos JavaScript para ejecutar en una página web.
+
+Debes responder SOLO JSON válido con esta estructura:
+{
+  "name": "nombre del comando",
+  "triggers": ["frase corta para invocarlo"],
+  "code": "código javascript (solo referencia visual, no se evalúa)",
+  "plan": {
+    "steps": [
+      { "type": "popup_elements", "title": "Elementos", "maxItems": 30, "maxChars": 120 }
+    ]
+  }
+}
+
+REGLAS:
+- El campo "code" es descriptivo para mostrar al usuario.
+- El campo "plan" ES OBLIGATORIO y es lo que se ejecutará sin eval.
+- steps permitidos:
+  1) popup_elements: crea popup con texto de elementos
+  2) highlight_elements: resalta elementos
+  3) hide_elements: oculta elementos
+  4) remove_elements: elimina elementos
+  5) console_log: imprime en consola resumen de elementos
+- No uses markdown, responde solo JSON.
+
+EJEMPLO de code:
+const items = context.elements || [];
+const popup = document.createElement("div");
+popup.style.position = "fixed";
+popup.style.top = "20px";
+popup.style.right = "20px";
+popup.style.zIndex = "999999";
+popup.style.background = "#fff";
+popup.style.border = "1px solid #ddd";
+popup.style.padding = "12px";
+popup.style.maxHeight = "60vh";
+popup.style.overflow = "auto";
+popup.innerHTML = "<h3>Elementos</h3>" + items.map((el, i) => "<div>" + (i + 1) + ". " + (el.textContent || "").trim().slice(0, 120) + "</div>").join("");
+document.body.appendChild(popup);
+return { success: true, message: "Popup creado", total: items.length };
+`
 }
 
 // ============ System Prompt: Análisis de estructura de página ============
