@@ -8,6 +8,8 @@ import { parseWithAI, isAIConfigured } from "./dsl/aiParser"
 import { executePageCommand } from "./dsl/pageExecutor"
 import { getAIConfig, saveAIConfig, clearAIConfig, type AIConfig } from "./services/aiService"
 
+const BUILD_TAG = "springer-fix-4"
+
 // Configuración del content script
 export const config: PlasmoCSConfig = {
   matches: ["<all_urls>"],
@@ -47,6 +49,27 @@ export const getStyle: PlasmoGetStyle = () => {
       box-shadow: 0 4px 12px rgba(0, 102, 255, 0.4);
       transition: all 0.3s ease;
       position: relative;
+    }
+
+    .floating-icon::after {
+      content: attr(data-build);
+      position: absolute;
+      right: -8px;
+      bottom: -8px;
+      font-size: 8px;
+      font-weight: 700;
+      line-height: 1;
+      padding: 3px 5px;
+      border-radius: 999px;
+      color: #0b3b91;
+      background: #ffffff;
+      border: 1px solid #d6e4ff;
+      box-shadow: 0 2px 6px rgba(0, 0, 0, 0.2);
+      max-width: 72px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      pointer-events: none;
     }
 
     .floating-icon:hover {
@@ -99,6 +122,22 @@ export const getStyle: PlasmoGetStyle = () => {
       font-weight: 600;
       margin: 0;
       color: white;
+    }
+
+    .panel-title {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .build-tag {
+      font-size: 10px;
+      font-weight: 700;
+      letter-spacing: 0.2px;
+      padding: 2px 6px;
+      border-radius: 999px;
+      color: #0b3b91;
+      background: rgba(255, 255, 255, 0.9);
     }
 
     .header-actions {
@@ -841,27 +880,135 @@ function FloatingPrompt() {
     }
   }
 
+  const hasInvisibleIntent = (text: string): boolean => {
+    const lower = text.toLowerCase().trim()
+    return (
+      lower.includes('invisible') ||
+      lower.includes('invisble') ||
+      lower.includes('invislbe') ||
+      lower.includes('invsible') ||
+      lower.includes('segundo plano') ||
+      lower.includes('sin abrir pestaña') ||
+      lower.includes('sin abrir pestana') ||
+      lower.includes('sin abrir tab')
+    )
+  }
+
+  const sanitizeSearchQuery = (query: string): string => {
+    return query
+      .replace(/\ben\s+segundo\s+plano\b/gi, ' ')
+      .replace(/\bsin\s+abrir\s+pestaña\b/gi, ' ')
+      .replace(/\bsin\s+abrir\s+pestana\b/gi, ' ')
+      .replace(/\bsin\s+abrir\s+tab\b/gi, ' ')
+      .replace(/\b(invisible|invisble|invislbe|invsible|visible)\b/gi, ' ')
+      .replace(/\s+/g, ' ')
+      .trim()
+  }
+
+  const normalizeSiteText = (site: string): string => {
+    const lower = site.toLowerCase().trim()
+    if (
+      lower.includes('scholar') ||
+      lower.includes('scgolar') ||
+      lower.includes('escholar') ||
+      lower.includes('google escholar')
+    ) return 'Google Scholar'
+    if (lower.includes('springer') || lower.includes('sprigner')) return 'Springer'
+    if (lower.includes('dblp')) return 'DBLP'
+    return site.trim()
+  }
+
+  const normalizeSelectionText = (selectionRaw: string): 'first result' | 'best result' | 'All' => {
+    const s = selectionRaw.toLowerCase()
+    if (s.includes('all') || s.includes('todo')) return 'All'
+    if (s.includes('first') || s.includes('primer') || s.includes('primero')) return 'first result'
+    return 'best result'
+  }
+
+  const extractChainSearchIntent = (rawInput: string): DSLCommand | null => {
+    const text = rawInput.trim()
+    const lower = text.toLowerCase()
+    const chainSignal =
+      lower.includes('por cada resultado') ||
+      lower.includes('por cada item') ||
+      lower.includes('por cada ítem')
+    if (!chainSignal) return null
+
+    // Ejemplo: "Busca en springer IOT y por cada resultado ... en google scholar ... best result"
+    const sourceMatch = text.match(
+      /(?:^|\s)busca(?:r)?\s+en\s+(google\s*scholar|google\s*escholar|scholar|springer|sprigner|dblp|amazon)\s+(.+?)\s+y\s+por\s+cada\s+resultado/i
+    )
+    if (!sourceMatch?.[1] || !sourceMatch?.[2]) return null
+
+    const sourceSite = normalizeSiteText(sourceMatch[1])
+    const sourceQuery = sanitizeSearchQuery(sourceMatch[2])
+    if (!sourceSite || !sourceQuery) return null
+
+    const targetSiteMatches = Array.from(
+      text.matchAll(/(?:en|a)\s+(google\s*scholar|google\s*escholar|scholar|springer|sprigner|dblp|amazon)/gi)
+    )
+    // Tomar el último sitio mencionado (normalmente el destino, después de "por cada resultado")
+    const lastTarget = targetSiteMatches[targetSiteMatches.length - 1]?.[1]
+    const targetSite = normalizeSiteText(lastTarget || 'Google Scholar')
+
+    const asksCitations =
+      /\b(citas|citations?|cited\s*by)\b/i.test(text) ||
+      /n[uú]mero\s+de\s+citas/i.test(text)
+    const propertyMatch = lower.match(/numero\s+de\s+([a-záéíóúñ_ ]+)|n[uú]mero\s+de\s+([a-záéíóúñ_ ]+)|\b(citas|citations?)\b/i)
+    const targetProperty = asksCitations
+      ? 'citations'
+      : (propertyMatch?.[1] || propertyMatch?.[2] || propertyMatch?.[3] || 'citations').trim()
+
+    const sourceProperty = lower.includes('titulo') || lower.includes('title') ? 'title' : 'title'
+    const selection = normalizeSelectionText(lower)
+
+    return {
+      action: 'chainSearch',
+      params: {
+        sourceSite,
+        sourceQuery,
+        sourceProperty,
+        targetSite,
+        targetProperty,
+        selection,
+        maxItems: 10
+      }
+    }
+  }
+
+  const normalizeSearchCommandParams = (cmd: DSLCommand): DSLCommand => {
+    if (cmd.action !== 'searchSite' && cmd.action !== 'searchSiteVisible') return cmd
+    const currentSite = String(cmd.params?.site || '').trim()
+    const currentQuery = String(cmd.params?.query || '').trim()
+    const cleanedQuery = sanitizeSearchQuery(currentQuery)
+    return {
+      ...cmd,
+      params: {
+        ...cmd.params,
+        site: currentSite,
+        query: cleanedQuery || currentQuery
+      }
+    }
+  }
+
   const normalizeParsedCommand = (rawInput: string, parsed: DSLCommand | null): DSLCommand | null => {
-    const text = rawInput.toLowerCase().trim()
-    const wantsInvisible =
-      text.includes('invisible') ||
-      text.includes('segundo plano') ||
-      text.includes('sin abrir pestaña') ||
-      text.includes('sin abrir pestana') ||
-      text.includes('sin abrir tab')
+    const chainIntent = extractChainSearchIntent(rawInput)
+    if (chainIntent) return chainIntent
+
+    const wantsInvisible = hasInvisibleIntent(rawInput)
 
     // Si la IA devolvió búsqueda de sitio, forzar modo visible/invisible según el texto
     if (parsed?.action === 'searchSite' && !wantsInvisible) {
-      return {
+      return normalizeSearchCommandParams({
         action: 'searchSiteVisible',
         params: parsed.params
-      }
+      })
     }
     if (parsed?.action === 'searchSiteVisible' && wantsInvisible) {
-      return {
+      return normalizeSearchCommandParams({
         action: 'searchSite',
         params: parsed.params
-      }
+      })
     }
 
     // Fallback regex para frases comunes, incluso si la IA falla
@@ -872,7 +1019,7 @@ function FloatingPrompt() {
       if (site && query) {
         return {
           action: wantsInvisible ? 'searchSite' : 'searchSiteVisible',
-          params: { site, query }
+          params: { site, query: sanitizeSearchQuery(query) || query }
         }
       }
     }
@@ -884,23 +1031,18 @@ function FloatingPrompt() {
       if (site && query) {
         return {
           action: wantsInvisible ? 'searchSite' : 'searchSiteVisible',
-          params: { site, query }
+          params: { site, query: sanitizeSearchQuery(query) || query }
         }
       }
     }
 
-    return parsed
+    return parsed ? normalizeSearchCommandParams(parsed) : parsed
   }
 
   const extractVisibleSearchIntent = (rawInput: string): { site: string; query: string } | null => {
     const text = rawInput.trim()
-    const lower = text.toLowerCase()
-    const wantsInvisible =
-      lower.includes('invisible') ||
-      lower.includes('segundo plano') ||
-      lower.includes('sin abrir pestaña') ||
-      lower.includes('sin abrir pestana') ||
-      lower.includes('sin abrir tab')
+    if (extractChainSearchIntent(text)) return null
+    const wantsInvisible = hasInvisibleIntent(text)
 
     if (wantsInvisible) return null
 
@@ -1034,7 +1176,10 @@ function FloatingPrompt() {
       {isOpen && (
         <div className="prompt-panel">
           <div className="panel-header">
-            <h3>🤖 AI Scraper</h3>
+            <div className="panel-title">
+              <h3>🤖 AI Scraper</h3>
+              <span className="build-tag">{BUILD_TAG}</span>
+            </div>
             <div className="header-actions">
               <button
                 className="gear-btn"
@@ -1434,6 +1579,74 @@ function FloatingPrompt() {
               </div>
             )}
 
+            {result && result.action === "chainSearch" && (
+              <div className="result-area">
+                <div className="result-scrape">
+                  <div className="scrape-header">
+                    <h4>🔗 Cadena: {result.source} → {result.target}</h4>
+                    <div style={{ display: 'flex', gap: '4px' }}>
+                      <button
+                        className="json-toggle-btn"
+                        onClick={() => setShowJson(!showJson)}>
+                        {showJson ? '📋 Vista' : '{ } JSON'}
+                      </button>
+                    </div>
+                  </div>
+
+                  <div className="scrape-meta">
+                    🔍 Query origen: <strong>{result.sourceQuery}</strong> |
+                    🎯 Enriquecimiento: {result.targetProperty} |
+                    🧭 Selección: {result.selection} |
+                    ✅ Enriquecidos: {result.enrichedItems}/{result.totalSourceItems}
+                  </div>
+
+                  {showJson ? (
+                    <div className="json-view">
+                      <pre>{JSON.stringify(result, null, 2)}</pre>
+                    </div>
+                  ) : (
+                    <div className="scrape-articles">
+                      {(result.results || []).map((item: ScrapedItem, i: number) => (
+                        <div key={`chain-item-${i}`} className="scrape-article">
+                          {(item.title || item.name) && (
+                            item.url ? (
+                              <a
+                                className="scrape-article-title"
+                                href={item.url}
+                                target="_blank"
+                                rel="noopener noreferrer">
+                                {item.title || item.name}
+                              </a>
+                            ) : (
+                              <span className="scrape-article-title">{item.title || item.name}</span>
+                            )
+                          )}
+
+                          {Object.entries(item)
+                            .filter(([key]) => !['title', 'name', 'url'].includes(key))
+                            .map(([key, value]) => {
+                              if (!value || value === '' || value === '0' || (Array.isArray(value) && value.length === 0)) return null
+                              const displayValue = Array.isArray(value) ? value.join(', ') : String(value)
+                              if (!displayValue) return null
+                              return (
+                                <div key={key} className="scrape-article-meta" style={{ marginBottom: '2px' }}>
+                                  <span style={{ fontWeight: 600, color: '#555', fontSize: '10px' }}>
+                                    {key}:
+                                  </span>{' '}
+                                  <span style={{ color: '#666', fontSize: '10px' }}>
+                                    {displayValue.length > 200 ? displayValue.substring(0, 200) + '...' : displayValue}
+                                  </span>
+                                </div>
+                              )
+                            })}
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              </div>
+            )}
+
             <div className="hint-text">
               🤖 Todo pasa por IA — escribe naturalmente.
               <br />
@@ -1451,8 +1664,9 @@ function FloatingPrompt() {
 
       <button
         className={`floating-icon ${isOpen ? "active" : ""}`}
+        data-build={BUILD_TAG}
         onClick={() => setIsOpen(!isOpen)}
-        title="Títulos App - IA">
+        title={`Títulos App - IA (${BUILD_TAG})`}>
         {isOpen ? "✕" : "🤖"}
       </button>
     </div>

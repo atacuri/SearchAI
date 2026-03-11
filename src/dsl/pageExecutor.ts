@@ -4,7 +4,7 @@
 // searchSiteVisible: abre la búsqueda en una pestaña nueva
 // createStructure: IA analiza el HTML y genera selectores CSS automáticamente
 
-import type { DSLCommand, SiteStructure, CreateStructureResult, ListStructuresResult } from '../types'
+import type { DSLCommand, SiteStructure, CreateStructureResult, ListStructuresResult, ScrapeResult } from '../types'
 import { scrapeCurrentPage, scrapeFromHtml, simplifyHtmlForAI } from '../services/scraperService'
 import { getStructureByName, buildSearchUrl, getAllStructures, saveStructure, deleteStructure } from '../services/structureStorage'
 import { getAIConfig } from '../services/aiService'
@@ -41,6 +41,9 @@ export async function executePageCommand(command: DSLCommand): Promise<any> {
         command.params.operator,
         command.params.value
       )
+
+    case 'chainSearch':
+      return await chainSearch(command.params)
 
     default:
       throw new Error(`Comando desconocido: ${command.action}`)
@@ -158,21 +161,88 @@ async function createStructure(): Promise<CreateStructureResult> {
     ).filter((p: any) => p.name_schema && p.selector_css_schema)
   }
 
+  // Verificar cuántos resultados encuentra con el selector de contenedor
+  let testResults = document.querySelectorAll(structure.result_container_selector)
+  let selectorAutoFixed = false
+  let previousSelector = structure.result_container_selector
+
+  if (testResults.length === 0) {
+    const inferredSelector = inferContainerSelectorForCurrentPage(structure, currentUrl)
+    if (inferredSelector) {
+      structure.result_container_selector = inferredSelector
+      testResults = document.querySelectorAll(structure.result_container_selector)
+      selectorAutoFixed = testResults.length > 0
+    }
+  }
+
+  if (testResults.length === 0) {
+    if (isChallengePage(document.body?.textContent || '', currentUrl)) {
+      throw new Error(
+        `Springer mostró una página de verificación (Client Challenge) y no resultados reales. ` +
+        `Por eso no se puede crear una estructura válida en este momento. ` +
+        `Abre la búsqueda en modo visible y, cuando veas tarjetas reales de resultados, vuelve a ejecutar "crea la estructura".`
+      )
+    }
+
+    throw new Error(
+      `La estructura detectada para "${structure.name}" no encontró resultados en esta página (0 matches). ` +
+      `No se guardó una estructura inválida. ` +
+      `Asegúrate de estar en una página con resultados visibles y vuelve a ejecutar "crea la estructura".`
+    )
+  }
+
   // Guardar la estructura en chrome.storage.local
   await saveStructure(structure)
 
-  // Verificar cuántos resultados encuentra con el selector de contenedor
-  const testResults = document.querySelectorAll(structure.result_container_selector)
   const propNames = structure.properties_object_semantic_structure_schema.map(p => p.name_schema).join(', ')
+  const selectorMessage = selectorAutoFixed
+    ? ` Se autocorrigió el selector de contenedor de "${previousSelector}" a "${structure.result_container_selector}".`
+    : ''
 
   return {
     action: 'createStructure',
     success: true,
     structure,
-    message: `Estructura creada para "${structure.name}" (${structure.object_semantic_structure_schema.type}). ` +
+    message: `Estructura  creada para "${structure.name}" (${structure.object_semantic_structure_schema.type}). ` +
       `Se detectaron ${testResults.length} resultados con ${structure.properties_object_semantic_structure_schema.length} propiedades: ${propNames}. ` +
-      `Ahora puedes usar "extraer resultados" o "en ${structure.name} busca [algo]".`
+      `Ahora puedes usar "extraer resultados" o "en ${structure.name} busca [algo]".` +
+      selectorMessage
   }
+}
+
+function inferContainerSelectorForCurrentPage(structure: SiteStructure, url: string): string | null {
+  const isSpringer =
+    structure.name.toLowerCase().includes('springer') ||
+    structure.url.toLowerCase().includes('springer.com') ||
+    url.toLowerCase().includes('springer.com')
+
+  if (isSpringer) {
+    const springerCandidates = [
+      'li.app-card-open',
+      'article.app-card-open',
+      'ol#results-list > li',
+      '[data-test="search-result"]',
+      '.app-search-layout__result'
+    ]
+    for (const selector of springerCandidates) {
+      const count = document.querySelectorAll(selector).length
+      if (count >= 2) return selector
+    }
+  }
+
+  const genericCandidates = [
+    'article',
+    'li',
+    '[role="article"]',
+    '.result',
+    '.search-result'
+  ]
+  for (const selector of genericCandidates) {
+    const count = document.querySelectorAll(selector).length
+    if (count >= 5) return selector
+  }
+
+  return null
 }
 
 /**
@@ -237,10 +307,204 @@ async function searchSite(siteName: string, query: string): Promise<any> {
     throw new Error(response?.error || 'Error al obtener la página en segundo plano')
   }
 
-  // Parsear el HTML obtenido con DOMParser (sin navegar)
-  const result = scrapeFromHtml(response.html, structure, query, searchUrl)
+  if (isChallengePage(response.html || '', searchUrl)) {
+    // Springer (y algunos sitios similares) bloquean fetch de extensiones con páginas challenge.
+    const visibleFallback = await searchSiteVisible(siteName, query)
+    return {
+      action: 'searchSite',
+      success: true,
+      source: structure.name,
+      query,
+      url: searchUrl,
+      blockedInvisible: true,
+      fallback: visibleFallback,
+      message:
+        `El sitio "${structure.name}" bloqueó el modo invisible (anti-bot/challenge). ` +
+        `Se abrió la búsqueda en una pestaña visible para continuar.`
+    }
+  }
 
-  return result
+  // Parsear el HTML obtenido con DOMParser (sin navegar)
+  try {
+    const result = scrapeFromHtml(response.html, structure, query, searchUrl)
+    return result
+  } catch (err: any) {
+    const isSpringerSite =
+      structure.name.toLowerCase().includes('springer') ||
+      structure.url.toLowerCase().includes('springer.com') ||
+      searchUrl.toLowerCase().includes('springer.com')
+
+    const message = String(err?.message || '')
+    const likelySelectorOrDynamicIssue =
+      message.includes('No se encontraron resultados con el selector') ||
+      message.includes('puede que la página esté vacía') ||
+      message.includes('changed its structure')
+
+    if (isSpringerSite && likelySelectorOrDynamicIssue) {
+      const visibleFallback = await searchSiteVisible(siteName, query)
+      return {
+        action: 'searchSite',
+        success: true,
+        source: structure.name,
+        query,
+        url: searchUrl,
+        blockedInvisible: true,
+        fallback: visibleFallback,
+        message:
+          `Springer no devolvió resultados parseables en modo invisible (HTML dinámico o protección anti-bot). ` +
+          `Se abrió la búsqueda en modo visible para continuar.`
+      }
+    }
+
+    throw err
+  }
+}
+
+async function searchSiteInvisibleRaw(structure: SiteStructure, query: string): Promise<ScrapeResult> {
+  if (!structure.search_url) {
+    throw new Error(
+      `La estructura de "${structure.name}" no tiene URL de búsqueda configurada. ` +
+      `Recrea la estructura navegando a una página de resultados del sitio.`
+    )
+  }
+
+  const searchUrl = buildSearchUrl(structure, query)
+  const response = await chrome.runtime.sendMessage({
+    type: 'FETCH_PAGE',
+    url: searchUrl
+  })
+
+  if (!response || !response.success) {
+    throw new Error(response?.error || `No se pudo obtener HTML invisible de ${structure.name}`)
+  }
+
+  if (isChallengePage(response.html || '', searchUrl)) {
+    throw new Error(
+      `El sitio "${structure.name}" bloqueó la búsqueda invisible con challenge anti-bot.`
+    )
+  }
+
+  return scrapeFromHtml(response.html, structure, query, searchUrl)
+}
+
+async function chainSearch(params: Record<string, any>): Promise<any> {
+  const sourceSite = String(params?.sourceSite || params?.fromSite || params?.site || '').trim()
+  const sourceQuery = String(params?.sourceQuery || params?.query || '').trim()
+  const sourceProperty = String(params?.sourceProperty || 'title').trim()
+  const targetSite = String(params?.targetSite || params?.toSite || 'Google Scholar').trim()
+  const targetPropertyRaw = String(params?.targetProperty || params?.property || 'citations').trim()
+  const targetProperty = normalizeRequestedProperty(targetPropertyRaw)
+  const selectionRaw = String(params?.selection || params?.type_of_search || 'best result').trim()
+  const maxItems = Number(params?.maxItems || 10)
+
+  if (!sourceSite || !sourceQuery) {
+    throw new Error(
+      'chainSearch requiere sourceSite y sourceQuery. ' +
+      'Ejemplo: "Busca en Springer IOT y por cada resultado busca citas en Scholar".'
+    )
+  }
+
+  const sourceStructure = await resolveStructureBySiteName(sourceSite)
+  const targetStructure = await resolveStructureBySiteName(targetSite)
+  if (!sourceStructure) throw new Error(`No se encontró estructura para sitio origen: "${sourceSite}".`)
+  if (!targetStructure) throw new Error(`No se encontró estructura para sitio destino: "${targetSite}".`)
+
+  // Modo estable: ambas búsquedas en invisible para evitar abrir pestañas.
+  const sourceResult = await searchSiteInvisibleRaw(sourceStructure, sourceQuery)
+  const sourceItems = Array.isArray(sourceResult.results) ? sourceResult.results.slice(0, Math.max(1, maxItems)) : []
+  if (sourceItems.length === 0) {
+    throw new Error(`No se encontraron resultados en "${sourceStructure.name}" para "${sourceQuery}".`)
+  }
+
+  const selection = normalizeSelectionType(selectionRaw)
+  const enrichedField = `${toSafeKey(targetStructure.name)}_${toSafeKey(targetProperty)}`
+  const enrichedItems: Record<string, any>[] = []
+  const errors: string[] = []
+  let enrichedCount = 0
+
+  for (const sourceItem of sourceItems) {
+    const seedQuery = String(readPropertyByAlias(sourceItem, sourceProperty) || '').trim()
+    const base = { ...sourceItem }
+    if (!seedQuery) {
+      base[enrichedField] = selection === 'All' ? [] : null
+      enrichedItems.push(base)
+      errors.push(`Item sin "${sourceProperty}" para buscar en ${targetStructure.name}.`)
+      continue
+    }
+
+    try {
+      const targetResult = await searchSiteInvisibleRaw(targetStructure, seedQuery)
+      const targetItems = Array.isArray(targetResult.results) ? targetResult.results : []
+      const selected = selectTargetItems(targetItems, seedQuery, selection)
+      const isCitationsTarget = toSafeKey(targetProperty) === 'citations'
+      const selectedValues = selected
+        .map(item =>
+          isCitationsTarget
+            ? extractBestCitationValueFromItem(item)
+            : readPropertyByAlias(item, targetProperty)
+        )
+        .filter(v => v !== '' && v !== null && v !== undefined)
+
+      if (selection === 'All') {
+        base[enrichedField] = selectedValues
+      } else {
+        base[enrichedField] = selectedValues[0] ?? null
+      }
+
+      base[`${toSafeKey(targetStructure.name)}_match_count`] = selected.length
+      enrichedItems.push(base)
+      if (selectedValues.length > 0) enrichedCount++
+    } catch (err: any) {
+      base[enrichedField] = selection === 'All' ? [] : null
+      enrichedItems.push(base)
+      errors.push(`"${seedQuery}": ${err?.message || 'error al consultar sitio destino'}`)
+    }
+  }
+
+  return {
+    action: 'chainSearch',
+    success: true,
+    source: sourceStructure.name,
+    target: targetStructure.name,
+    sourceQuery,
+    sourceProperty,
+    targetProperty,
+    selection,
+    totalSourceItems: sourceItems.length,
+    enrichedItems: enrichedCount,
+    results: enrichedItems,
+    errors,
+    message:
+      `Cadena completada: ${sourceStructure.name} -> ${targetStructure.name}. ` +
+      `Se enriquecieron ${enrichedCount} de ${sourceItems.length} items con "${targetProperty}".`
+  }
+}
+
+function isChallengePage(html: string, url: string): boolean {
+  if (!html) return false
+  const text = html.toLowerCase()
+  const urlLower = url.toLowerCase()
+
+  const commonSignals = [
+    'client challenge',
+    'required part of this site couldn’t load',
+    "required part of this site couldn't load",
+    'captcha',
+    'access denied',
+    'verify you are human',
+    'cf-chl',
+    'cloudflare'
+  ]
+
+  const hasSignal = commonSignals.some(signal => text.includes(signal))
+  if (hasSignal) return true
+
+  // Springer suele responder una página de challenge al fetch invisible.
+  if (urlLower.includes('springer.com')) {
+    return text.includes('challenge') || text.includes('enable javascript')
+  }
+
+  return false
 }
 
 /**
@@ -346,7 +610,178 @@ function normalizeSiteName(siteName: string): string {
   ) {
     return 'Google Scholar'
   }
+  if (input.includes('escholar') || input.includes('google escholar')) {
+    return 'Google Scholar'
+  }
+  if (
+    input.includes('springer') ||
+    input.includes('sprigner') ||
+    input.includes('springuer')
+  ) {
+    return 'Springer'
+  }
   return siteName
+}
+
+function normalizeSelectionType(selection: string): 'first result' | 'best result' | 'All' {
+  const lower = (selection || '').toLowerCase().trim()
+  if (lower.includes('all') || lower.includes('todos') || lower.includes('todo')) return 'All'
+  if (lower.includes('first') || lower.includes('primero') || lower === '1') return 'first result'
+  return 'best result'
+}
+
+function selectTargetItems(items: Record<string, any>[], seedQuery: string, selection: 'first result' | 'best result' | 'All') {
+  if (items.length === 0) return []
+  if (selection === 'All') return items
+  if (selection === 'first result') return [items[0]]
+
+  // "best result": similitud simple por tokens contra título/nombre del resultado.
+  let bestIndex = 0
+  let bestScore = -1
+  const seed = normalizeText(seedQuery)
+  const seedTokens = new Set(seed.split(' ').filter(Boolean))
+
+  items.forEach((item, idx) => {
+    const title = String(
+      readPropertyByAlias(item, 'title') ??
+      readPropertyByAlias(item, 'name') ??
+      ''
+    )
+    const candidate = normalizeText(title)
+    if (!candidate) return
+    const candidateTokens = new Set(candidate.split(' ').filter(Boolean))
+    let overlap = 0
+    seedTokens.forEach(t => {
+      if (candidateTokens.has(t)) overlap++
+    })
+    const score =
+      overlap +
+      (candidate === seed ? 5 : 0) +
+      (candidate.includes(seed) || seed.includes(candidate) ? 2 : 0)
+    if (score > bestScore) {
+      bestScore = score
+      bestIndex = idx
+    }
+  })
+
+  return [items[bestIndex]]
+}
+
+function readPropertyByAlias(item: Record<string, any>, requested: string): any {
+  if (!item || typeof item !== 'object') return null
+  const requestedNorm = toSafeKey(normalizeRequestedProperty(requested))
+  const entries = Object.entries(item)
+  if (entries.length === 0) return null
+
+  const exact = entries.find(([k]) => toSafeKey(k) === requestedNorm)
+  if (exact) return exact[1]
+
+  const aliases: Record<string, string[]> = {
+    title: ['title', 'name', 'titulo', 'título'],
+    citations: ['citations', 'citation', 'citas', 'citedby', 'cited_by', 'numerodecitas', 'numerocitas'],
+    url: ['url', 'link', 'href'],
+    authors: ['authors', 'author', 'autores', 'autor']
+  }
+
+  for (const aliasList of Object.values(aliases)) {
+    const normalizedAlias = aliasList.map(toSafeKey)
+    if (!normalizedAlias.includes(requestedNorm)) continue
+    const found = entries.find(([k]) => normalizedAlias.includes(toSafeKey(k)))
+    if (found) return found[1]
+  }
+
+  const partial = entries.find(([k]) => {
+    const n = toSafeKey(k)
+    return n.includes(requestedNorm) || requestedNorm.includes(n)
+  })
+  return partial ? partial[1] : null
+}
+
+function normalizeRequestedProperty(property: string): string {
+  const normalized = toSafeKey(property)
+  if (
+    normalized.includes('citation') ||
+    normalized.includes('citas') ||
+    normalized.includes('citedby') ||
+    normalized.includes('numerodecitas') ||
+    normalized.includes('numerocitas')
+  ) {
+    return 'citations'
+  }
+  if (normalized.includes('titulo') || normalized.includes('title') || normalized.includes('name')) {
+    return 'title'
+  }
+  if (normalized.includes('autor') || normalized.includes('author')) {
+    return 'authors'
+  }
+  if (normalized.includes('url') || normalized.includes('link') || normalized.includes('href')) {
+    return 'url'
+  }
+  return property
+}
+
+function toSafeKey(text: string): string {
+  return String(text || '')
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[^a-z0-9]/g, '')
+}
+
+function normalizeText(text: string): string {
+  return String(text || '')
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[^a-z0-9 ]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+}
+
+function extractBestCitationValueFromItem(item: Record<string, any>): number | string | null {
+  const entries = Object.entries(item || {})
+
+  // 1) Prioridad máxima: campos cuyo nombre parece de citas.
+  for (const [key, value] of entries) {
+    const keyNorm = toSafeKey(key)
+    const citationLikeKey =
+      keyNorm.includes('citation') ||
+      keyNorm.includes('citas') ||
+      keyNorm.includes('citedby')
+    if (!citationLikeKey) continue
+
+    const strict = extractCitationFromTextStrict(String(value ?? ''))
+    if (Number.isFinite(strict)) return strict
+
+    const numberOnly = extractLooseNumber(String(value ?? ''))
+    if (Number.isFinite(numberOnly)) return numberOnly
+  }
+
+  // 2) Buscar patrón explícito "cited by/citado por" en cualquier campo.
+  for (const [, value] of entries) {
+    const strict = extractCitationFromTextStrict(String(value ?? ''))
+    if (Number.isFinite(strict)) return strict
+  }
+
+  const direct = readPropertyByAlias(item, 'citations')
+  if (direct !== null && direct !== undefined && String(direct).trim() !== '') {
+    const strict = extractCitationFromTextStrict(String(direct))
+    if (Number.isFinite(strict)) return strict
+  }
+  return null
+}
+
+function extractCitationFromTextStrict(text: string): number {
+  const lower = text.toLowerCase()
+  const citedBy = lower.match(/(?:cited\s+by|citado\s+por)\s*(\d+)/i)
+  if (citedBy?.[1]) return parseInt(citedBy[1], 10)
+  return NaN
+}
+
+function extractLooseNumber(text: string): number {
+  const match = text.match(/\d+(?:[.,]\d+)?/)
+  if (!match) return NaN
+  return parseFloat(match[0].replace(/,/g, ''))
 }
 
 function buildFallbackSearchUrl(siteName: string, query: string): string | null {

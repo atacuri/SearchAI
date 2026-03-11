@@ -455,6 +455,27 @@ ${colorsList}
    - "value" es el valor a comparar
    - Ejemplos: "resalta artículos con más de 100 citas", "resaltar productos con precio mayor a 500", "marca resultados con year >= 2020"
 
+10. chainSearch: Encadena búsquedas entre dos sitios y enriquece cada item del origen con datos del destino
+   - Parámetros:
+     {
+       "sourceSite": string,
+       "sourceQuery": string,
+       "sourceProperty": string,
+       "targetSite": string,
+       "targetProperty": string,
+       "selection": "first result" | "best result" | "All",
+       "maxItems": number
+     }
+   - La búsqueda del sourceSite se ejecuta en modo invisible
+   - La búsqueda del targetSite se ejecuta en modo invisible por cada item del origen
+   - "sourceProperty" suele ser "title"
+   - "targetProperty" suele ser "citations"
+   - "selection" define cómo elegir en el sitio destino:
+     ${JSON.stringify(type_of_search)}
+   - Ejemplos:
+     "Busca en springer IOT y por cada resultado toma el título y busca citas en google scholar con best result"
+     "En DBLP busca llm y por cada paper consulta en scholar usando first result"
+
 INSTRUCCIONES:
 - Responde SOLO con un objeto JSON válido
 - Formatos:
@@ -467,14 +488,28 @@ INSTRUCCIONES:
   { "action": "listStructures", "params": {} }
   { "action": "deleteStructure", "params": { "name": "DBLP" } }
   { "action": "highlightByCondition", "params": { "property": "citations", "operator": ">", "value": 100 } }
+  {
+    "action": "chainSearch",
+    "params": {
+      "sourceSite": "Springer",
+      "sourceQuery": "iot",
+      "sourceProperty": "title",
+      "targetSite": "Google Scholar",
+      "targetProperty": "citations",
+      "selection": "best result",
+      "maxItems": 10
+    }
+  }
 - Si no entiendes el comando: { "action": null, "params": {} }
 - Por defecto, para frases tipo "en [sitio] busca [query]": usa searchSiteVisible
-- Si el usuario pide "invisible", "en segundo plano", "sin abrir pestaña": usa searchSite (modo invisible + extracción)
+- Si el usuario pide "invisible", "invisble", "invislbe", "invsible", "en segundo plano", "sin abrir pestaña": usa searchSite (modo invisible + extracción)
+- En sitios que bloquean el fetch invisible (ej. challenge anti-bot), el executor hará fallback automático a modo visible
 - Para extraer datos de la página actual: usa scrapeResults
 - Para analizar/aprender la estructura de una página: usa createStructure
 - Para ver las estructuras guardadas: usa listStructures
 - Para eliminar una estructura: usa deleteStructure
 - Para resaltar resultados por condición en la página actual: usa highlightByCondition
+- Para búsquedas encadenadas entre sitios (enriquecer items): usa chainSearch
 - "scholar" = "Google Scholar", "springer" = "Springer", "dblp" = "DBLP"`
 }
 
@@ -503,6 +538,22 @@ const STRUCTURE_SCHEMA = {
     "Array de propiedades del objeto, cada una con la estructura de properties_schema"
   ]
 }
+
+
+
+const type_of_search= [
+  {
+    name: "first result",
+    number_results: "1"
+  }, {
+    name: "best result",
+    number_results: "1"
+  }, {
+    name: "All",
+    number_results: "All"
+  }]
+
+
 
 function buildAnalyzePagePrompt(): string {
   return `Eres un experto en web scraping y análisis de estructuras HTML. Tu tarea es analizar una página web y crear una estructura COMPLETA de scraping extrayendo TODAS las propiedades visibles.

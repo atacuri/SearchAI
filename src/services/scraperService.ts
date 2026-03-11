@@ -83,9 +83,41 @@ function scrapeDocument(
   }
 
   // Buscar todos los contenedores de resultados
-  const resultElements = doc.querySelectorAll(result_container_selector)
+  let resultElements = Array.from(doc.querySelectorAll(result_container_selector)) as HTMLElement[]
+
+  // Fallbacks específicos para Springer cuando el selector generado por IA queda obsoleto.
+  if (resultElements.length === 0 && isSpringerStructure(structure, url)) {
+    const springerFallbackSelectors = [
+      'li.app-card-open',
+      'article.app-card-open',
+      'ol#results-list li',
+      '[data-test="search-result"]',
+      '.app-search-layout__result'
+    ]
+    for (const sel of springerFallbackSelectors) {
+      const candidates = Array.from(doc.querySelectorAll(sel)) as HTMLElement[]
+      if (candidates.length > 0) {
+        resultElements = candidates
+        break
+      }
+    }
+  }
+
+  // Fallback heurístico: detecta resultados por enlaces típicos de contenido Springer.
+  if (resultElements.length === 0 && isSpringerSearchUrl(url)) {
+    const inferred = inferSpringerResultContainers(doc)
+    if (inferred.length > 0) {
+      resultElements = inferred
+    }
+  }
 
   if (resultElements.length === 0) {
+    if (isLikelyChallengePage(doc)) {
+      throw new Error(
+        `El sitio devolvió una página de verificación/bloqueo (challenge) en lugar de resultados. ` +
+        `Intenta la búsqueda en modo visible para continuar.`
+      )
+    }
     throw new Error(
       `No se encontraron resultados con el selector "${result_container_selector}" ` +
       `en ${structure.name}. Puede que la página esté vacía o haya cambiado su estructura.`
@@ -97,7 +129,7 @@ function scrapeDocument(
 
   resultElements.forEach((element) => {
     try {
-      const item = extractItemGeneric(element as HTMLElement, properties)
+      const item = extractItemGeneric(element, properties)
       // Solo agregar si tiene al menos una propiedad con valor
       const hasContent = Object.values(item).some(v => v !== '' && v !== null && v !== undefined)
       if (hasContent) {
@@ -121,6 +153,66 @@ function scrapeDocument(
   }
 }
 
+function isSpringerStructure(structure: SiteStructure, url: string): boolean {
+  const name = structure.name.toLowerCase()
+  const baseUrl = structure.url.toLowerCase()
+  const currentUrl = url.toLowerCase()
+  return (
+    name.includes('springer') ||
+    baseUrl.includes('springer.com') ||
+    currentUrl.includes('springer.com')
+  )
+}
+
+function isSpringerSearchUrl(url: string): boolean {
+  const lower = url.toLowerCase()
+  return lower.includes('link.springer.com/search')
+}
+
+function inferSpringerResultContainers(doc: Document): HTMLElement[] {
+  const linkSelector = [
+    'a[href*="/article/"]',
+    'a[href*="/chapter/"]',
+    'a[href*="/book/"]',
+    'a[href*="/referenceworkentry/"]'
+  ].join(',')
+
+  const candidates = Array.from(doc.querySelectorAll('li, article, div')) as HTMLElement[]
+  const filtered = candidates.filter((el) => {
+    const contentLink = el.querySelector(linkSelector)
+    if (!contentLink) return false
+    const hasTitle = !!el.querySelector('h2, h3, [data-test*="title"]')
+    const textLen = (el.textContent || '').trim().length
+    return hasTitle && textLen > 30
+  })
+
+  if (filtered.length === 0) return []
+
+  // Evitar contenedores anidados para quedarnos con "cards" de nivel resultado.
+  const set = new Set(filtered)
+  const topLevel = filtered.filter((el) => {
+    let parent = el.parentElement
+    while (parent) {
+      if (set.has(parent as HTMLElement)) return false
+      parent = parent.parentElement
+    }
+    return true
+  })
+
+  return topLevel.slice(0, 200)
+}
+
+function isLikelyChallengePage(doc: Document): boolean {
+  const text = (doc.body?.textContent || '').toLowerCase()
+  return (
+    text.includes('client challenge') ||
+    text.includes("required part of this site couldn't load") ||
+    text.includes('required part of this site couldn’t load') ||
+    text.includes('verify you are human') ||
+    text.includes('captcha')
+  )
+}
+
 // ============ Extractor genérico de un resultado individual ============
 
 /**
@@ -142,15 +234,22 @@ function extractItemGeneric(
   for (const prop of properties) {
     const { type_schema, name_schema, selector_css_schema } = prop
 
-    if (!selector_css_schema) {
-      item[name_schema] = ''
-      continue
-    }
-
     try {
-      item[name_schema] = extractByType(element, selector_css_schema, type_schema)
+      const key = normalizePropertyKey(name_schema)
+      if (isCitationKey(key)) {
+        const citationValue = extractCitationForProperty(element, selector_css_schema)
+        if (Number.isFinite(citationValue)) {
+          item[name_schema] = citationValue
+          continue
+        }
+      }
+
+      const baseValue = selector_css_schema
+        ? extractByType(element, selector_css_schema, type_schema)
+        : ''
+      item[name_schema] = withSemanticFallback(element, name_schema, type_schema, baseValue)
     } catch {
-      item[name_schema] = ''
+      item[name_schema] = withSemanticFallback(element, name_schema, type_schema, '')
     }
   }
 
@@ -226,6 +325,123 @@ function extractByType(
       const el = element.querySelector(selector)
       return el?.textContent?.trim() || ''
   }
+}
+
+function withSemanticFallback(
+  element: HTMLElement,
+  propertyName: string,
+  type: string,
+  currentValue: any
+): any {
+  if (hasUsableValue(currentValue)) return currentValue
+
+  const key = normalizePropertyKey(propertyName)
+
+  if (isCitationKey(key)) {
+    const citations = extractCitationForProperty(element, '')
+    if (Number.isFinite(citations)) return citations
+  }
+
+  if (key.includes('title') || key.includes('name') || key.includes('titulo')) {
+    const titleEl = element.querySelector('h1, h2, h3, [data-test*="title"], a[href*="/article/"], a[href*="/chapter/"]')
+    const text = titleEl?.textContent?.trim() || ''
+    return text || currentValue
+  }
+
+  if (key.includes('url') || key.includes('link')) {
+    const link = element.querySelector('a[href*="/article/"], a[href*="/chapter/"], a[href*="/book/"], a[href]') as HTMLAnchorElement | null
+    const href = link?.getAttribute('href') || ''
+    return href || currentValue
+  }
+
+  if (key.includes('author') || key.includes('autores')) {
+    const authorEl = element.querySelector('.c-list-authors, [data-test*="author"], .authors')
+    return authorEl?.textContent?.trim() || currentValue
+  }
+
+  if (key.includes('abstract') || key.includes('summary') || key.includes('snippet')) {
+    const summaryEl = element.querySelector('p, [data-test*="snippet"], .c-card__summary')
+    return summaryEl?.textContent?.trim() || currentValue
+  }
+
+  if (key.includes('date') || key.includes('year') || key.includes('anio') || key.includes('año')) {
+    const text = element.textContent || ''
+    const year = text.match(/\b(19|20)\d{2}\b/)
+    return year?.[0] || currentValue
+  }
+
+  if (key.includes('doi')) {
+    const doiLink = element.querySelector('a[href*="doi.org"], a[href*="/doi/"]') as HTMLAnchorElement | null
+    const href = doiLink?.getAttribute('href') || ''
+    if (href) return href
+    const text = element.textContent || ''
+    const doiText = text.match(/\b10\.\d{4,9}\/[-._;()/:A-Z0-9]+\b/i)
+    return doiText?.[0] || currentValue
+  }
+
+  if (type === 'number') {
+    const n = extractNumberFromText(element.textContent || '')
+    return Number.isFinite(n) ? n : currentValue
+  }
+
+  return currentValue
+}
+
+function hasUsableValue(value: any): boolean {
+  if (Array.isArray(value)) return value.length > 0
+  return value !== '' && value !== null && value !== undefined
+}
+
+function normalizePropertyKey(text: string): string {
+  return text
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[^a-z0-9]/g, '')
+}
+
+function extractNumberFromText(text: string): number {
+  const match = text.match(/-?\d+(?:[.,]\d+)?/)
+  if (!match) return NaN
+  return parseFloat(match[0].replace(/,/g, ''))
+}
+
+function isCitationKey(normalizedKey: string): boolean {
+  return (
+    normalizedKey.includes('citation') ||
+    normalizedKey.includes('citas') ||
+    normalizedKey.includes('citedby') ||
+    normalizedKey.includes('numerodecitas') ||
+    normalizedKey.includes('numerocitas')
+  )
+}
+
+function extractCitationForProperty(element: HTMLElement, selector: string): number {
+  const nodes = selector
+    ? Array.from(element.querySelectorAll(selector))
+    : Array.from(element.querySelectorAll('a, span, div'))
+
+  let best = NaN
+  for (const node of nodes) {
+    const text = (node as HTMLElement).textContent || ''
+    const byMatch = text.match(/(?:cited\s+by|citado\s+por)\s*(\d+)/i)
+    if (byMatch?.[1]) {
+      const n = parseInt(byMatch[1], 10)
+      if (Number.isFinite(n) && (!Number.isFinite(best) || n > best)) best = n
+    }
+  }
+
+  if (Number.isFinite(best)) return best
+
+  // Fallback: revisar texto completo del item por patrón explícito de citas.
+  const itemText = element.textContent || ''
+  const itemMatch = itemText.match(/(?:cited\s+by|citado\s+por)\s*(\d+)/i)
+  if (itemMatch?.[1]) {
+    const n = parseInt(itemMatch[1], 10)
+    if (Number.isFinite(n)) return n
+  }
+
+  return NaN
 }
 
 // ============ Utilidades ============
