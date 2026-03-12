@@ -7,6 +7,7 @@ import type { DSLCommand, ScrapeResult, ScrapedItem, CreateStructureResult, List
 import { parseWithAI, isAIConfigured } from "./dsl/aiParser"
 import { executePageCommand } from "./dsl/pageExecutor"
 import { getAIConfig, saveAIConfig, clearAIConfig, type AIConfig } from "./services/aiService"
+import { getAllStructures } from "./services/structureStorage"
 
 const BUILD_TAG = "springer-fix-4"
 const LAST_CHAIN_RESULT_KEY = "ai_last_chain_result"
@@ -829,6 +830,7 @@ function FloatingPrompt() {
   const [configSaved, setConfigSaved] = useState(false)
   const [runningPendingChain, setRunningPendingChain] = useState(false)
   const [runningPendingVisible, setRunningPendingVisible] = useState(false)
+  const [knownSiteNames, setKnownSiteNames] = useState<string[]>([])
 
   useEffect(() => {
     chrome.storage.local.get(LAST_CHAIN_RESULT_KEY).then((stored) => {
@@ -839,6 +841,38 @@ function FloatingPrompt() {
     }).catch(() => {
       // noop
     })
+  }, [])
+
+  useEffect(() => {
+    const loadKnownSitesFromStorage = async () => {
+      try {
+        const structures = await getAllStructures()
+        const names = structures
+          .map((s) => String(s.name || '').trim())
+          .filter(Boolean)
+        setKnownSiteNames(names)
+      } catch {
+        setKnownSiteNames([])
+      }
+    }
+
+    // Carga inicial desde chrome.storage.local
+    loadKnownSitesFromStorage()
+
+    // Mantener aliases dinámicos sincronizados cuando cambien estructuras guardadas.
+    const handleStorageChanged = (
+      changes: Record<string, chrome.storage.StorageChange>,
+      areaName: string
+    ) => {
+      if (areaName === 'local' && changes['site_structures']) {
+        loadKnownSitesFromStorage()
+      }
+    }
+
+    chrome.storage.onChanged.addListener(handleStorageChanged)
+    return () => {
+      chrome.storage.onChanged.removeListener(handleStorageChanged)
+    }
   }, [])
 
   useEffect(() => {
@@ -1009,6 +1043,12 @@ function FloatingPrompt() {
 
   const normalizeSiteText = (site: string): string => {
     const lower = site.toLowerCase().trim()
+    const dynamicMatch = knownSiteNames.find((name) => {
+      const n = name.toLowerCase().trim()
+      return lower === n || lower.includes(n) || n.includes(lower)
+    })
+    if (dynamicMatch) return dynamicMatch
+
     if (
       lower.includes('scholar') ||
       lower.includes('scgolar') ||
@@ -1018,6 +1058,47 @@ function FloatingPrompt() {
     if (lower.includes('springer') || lower.includes('sprigner')) return 'Springer'
     if (lower.includes('dblp')) return 'DBLP'
     return site.trim()
+  }
+
+  const getDynamicSiteAliases = (): string[] => {
+    // Se alimenta de knownSiteNames, que viene de chrome.storage.local (site_structures).
+    const base = [
+      "google scholar",
+      "google escholar",
+      "scholar",
+      "springer",
+      "sprigner",
+      "dblp",
+      "amazon"
+    ]
+
+    const dynamic = knownSiteNames.flatMap((name) => {
+      const trimmed = name.trim()
+      const withoutSpaces = trimmed.replace(/\s+/g, '')
+      const lowered = trimmed.toLowerCase()
+      return [trimmed, withoutSpaces, lowered]
+    })
+
+    const set = new Set<string>([...base, ...dynamic].filter(Boolean))
+    return Array.from(set).sort((a, b) => b.length - a.length)
+  }
+
+  const escapeRegex = (text: string): string =>
+    text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+
+  const buildDynamicSitePattern = (): string => {
+    const aliases = getDynamicSiteAliases()
+    const patterns = aliases.map((alias) => escapeRegex(alias).replace(/\s+/g, "\\s*"))
+    return patterns.length > 0 ? patterns.join("|") : "google\\s*scholar|springer|dblp|amazon"
+  }
+
+  const hasChainSignal = (text: string): boolean => {
+    const lower = text.toLowerCase()
+    return (
+      lower.includes('por cada resultado') ||
+      lower.includes('por cada item') ||
+      lower.includes('por cada ítem')
+    )
   }
 
   const normalizeSelectionText = (selectionRaw: string): 'first result' | 'best result' | 'All' => {
@@ -1030,15 +1111,15 @@ function FloatingPrompt() {
   const extractChainSearchIntent = (rawInput: string): DSLCommand | null => {
     const text = rawInput.trim()
     const lower = text.toLowerCase()
-    const chainSignal =
-      lower.includes('por cada resultado') ||
-      lower.includes('por cada item') ||
-      lower.includes('por cada ítem')
-    if (!chainSignal) return null
+    if (!hasChainSignal(lower)) return null
 
-    // Ejemplo: "Busca en springer IOT y por cada resultado ... en google scholar ... best result"
+    const sitePattern = buildDynamicSitePattern()
+
     const sourceMatch = text.match(
-      /(?:^|\s)busca(?:r)?\s+en\s+(google\s*scholar|google\s*escholar|scholar|springer|sprigner|dblp|amazon)\s+(.+?)\s+y\s+por\s+cada\s+resultado/i
+      new RegExp(
+        `(?:^|\\s)busca(?:r)?\\s+en\\s+(${sitePattern})\\s+(.+?)\\s+y\\s+por\\s+cada\\s+resultado`,
+        'i'
+      )
     )
     if (!sourceMatch?.[1] || !sourceMatch?.[2]) return null
 
@@ -1047,7 +1128,7 @@ function FloatingPrompt() {
     if (!sourceSite || !sourceQuery) return null
 
     const targetSiteMatches = Array.from(
-      text.matchAll(/(?:en|a)\s+(google\s*scholar|google\s*escholar|scholar|springer|sprigner|dblp|amazon)/gi)
+      text.matchAll(new RegExp(`(?:en|a)\\s+(${sitePattern})`, 'gi'))
     )
     // Tomar el último sitio mencionado (normalmente el destino, después de "por cada resultado")
     const lastTarget = targetSiteMatches[targetSiteMatches.length - 1]?.[1]
@@ -1158,7 +1239,7 @@ function FloatingPrompt() {
 
   const extractVisibleSearchIntent = (rawInput: string): { site: string; query: string } | null => {
     const text = rawInput.trim()
-    if (extractChainSearchIntent(text)) return null
+    if (hasChainSignal(text)) return null
     const wantsInvisible = hasInvisibleIntent(text)
     const wantsVisible = hasVisibleIntent(text)
 

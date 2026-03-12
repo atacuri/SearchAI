@@ -4,7 +4,7 @@
 // searchSiteVisible: abre la búsqueda en una pestaña nueva
 // createStructure: IA analiza el HTML y genera selectores CSS automáticamente
 
-import type { DSLCommand, SiteStructure, CreateStructureResult, ListStructuresResult, ScrapeResult } from '../types'
+import type { DSLCommand, SiteStructure, CreateStructureResult, ListStructuresResult, ScrapeResult, PropertySchema } from '../types'
 import { scrapeCurrentPage, scrapeFromHtml, simplifyHtmlForAI } from '../services/scraperService'
 import { getStructureByName, buildSearchUrl, getAllStructures, saveStructure, deleteStructure } from '../services/structureStorage'
 import { getAIConfig } from '../services/aiService'
@@ -326,7 +326,7 @@ async function searchSite(siteName: string, query: string): Promise<any> {
   // Parsear el HTML obtenido con DOMParser (sin navegar)
   try {
     const result = scrapeFromHtml(response.html, structure, query, searchUrl)
-    return result
+    return await enrichWithDetailPageProperties(result, structure)
   } catch (err: any) {
     const isSpringerSite =
       structure.name.toLowerCase().includes('springer') ||
@@ -380,7 +380,8 @@ async function searchSiteInvisibleRaw(structure: SiteStructure, query: string): 
     )
   }
 
-  return scrapeFromHtml(response.html, structure, query, searchUrl)
+  const base = scrapeFromHtml(response.html, structure, query, searchUrl)
+  return await enrichWithDetailPageProperties(base, structure)
 }
 
 async function chainSearch(params: Record<string, any>): Promise<any> {
@@ -409,27 +410,28 @@ async function chainSearch(params: Record<string, any>): Promise<any> {
   if (!targetStructure) throw new Error(`No se encontró estructura para sitio destino: "${targetSite}".`)
   const sourceSearchUrl = buildSearchUrl(sourceStructure, sourceQuery)
   const selection = normalizeSelectionType(selectionRaw)
+  const buildNavigateResponse = () => ({
+    action: 'chainSearchNavigate',
+    success: true,
+    source: sourceStructure.name,
+    sourceQuery,
+    sourceSearchUrl,
+    pendingTask: {
+      sourceSite: sourceStructure.name,
+      sourceQuery,
+      sourceProperty,
+      targetSite: targetStructure.name,
+      targetProperty,
+      selection,
+      maxItems,
+      openSourceInSameTab: true
+    },
+    message: `Abriendo ${sourceStructure.name} en la pestaña actual para aplicar augmentación con citas...`
+  })
 
   if (openSourceInSameTab) {
     if (!isCurrentPageFromStructure(sourceStructure, sourceQuery)) {
-      return {
-        action: 'chainSearchNavigate',
-        success: true,
-        source: sourceStructure.name,
-        sourceQuery,
-        sourceSearchUrl,
-        pendingTask: {
-          sourceSite: sourceStructure.name,
-          sourceQuery,
-          sourceProperty,
-          targetSite: targetStructure.name,
-          targetProperty,
-          selection,
-          maxItems,
-          openSourceInSameTab: true
-        },
-        message: `Abriendo ${sourceStructure.name} en la pestaña actual para aplicar augmentación con citas...`
-      }
+      return buildNavigateResponse()
     }
 
     return await chainAugmentCurrentPage({
@@ -444,7 +446,20 @@ async function chainSearch(params: Record<string, any>): Promise<any> {
   }
 
   // Modo estable: ambas búsquedas en invisible para evitar abrir pestañas.
-  const sourceResult = await searchSiteInvisibleRaw(sourceStructure, sourceQuery)
+  let sourceResult: ScrapeResult
+  try {
+    sourceResult = await searchSiteInvisibleRaw(sourceStructure, sourceQuery)
+  } catch (err: any) {
+    const msg = String(err?.message || '')
+    const sourceIsOftenBlocked =
+      sourceStructure.name.toLowerCase().includes('springer') ||
+      sourceStructure.url.toLowerCase().includes('springer.com')
+    if (sourceIsOftenBlocked && isInvisibleBlockedError(msg)) {
+      // Fallback inteligente para que el chain no se "rompa" con challenge.
+      return buildNavigateResponse()
+    }
+    throw err
+  }
   const sourceItems = Array.isArray(sourceResult.results) ? sourceResult.results.slice(0, Math.max(1, maxItems)) : []
   if (sourceItems.length === 0) {
     throw new Error(`No se encontraron resultados en "${sourceStructure.name}" para "${sourceQuery}".`)
@@ -893,6 +908,182 @@ function applyAugmentationToContainer(container: HTMLElement | undefined, value:
   } else {
     container.prepend(badge)
   }
+}
+
+async function enrichWithDetailPageProperties(result: ScrapeResult, structure: SiteStructure): Promise<ScrapeResult> {
+  if (!result?.results || result.results.length === 0) return result
+
+  const detailProps = structure.properties_object_semantic_structure_schema.filter((p) =>
+    isLikelyDetailProperty(p.name_schema)
+  )
+  if (detailProps.length === 0) return result
+
+  const enriched = result.results.map((item) => ({ ...item }))
+  let detailHits = 0
+  const maxItemsToVisit = Math.min(enriched.length, 10)
+
+  for (let i = 0; i < maxItemsToVisit; i++) {
+    const item = enriched[i]
+
+    const rawUrl =
+      readPropertyByAlias(item, 'url') ||
+      readPropertyByAlias(item, 'link') ||
+      readPropertyByAlias(item, 'href')
+    if (!rawUrl) continue
+
+    const detailUrl = resolveAbsoluteUrl(String(rawUrl), result.url || structure.url)
+    if (!detailUrl) continue
+
+    // Fallback inmediato: muchos sitios (como Springer) incluyen DOI en la propia URL.
+    for (const prop of detailProps) {
+      const key = toSafeKey(prop.name_schema)
+      if (key.includes('doi') && isMissingValue(item[prop.name_schema])) {
+        const doiFromUrl = extractDoiFromUrl(detailUrl)
+        if (!isMissingValue(doiFromUrl)) {
+          item[prop.name_schema] = doiFromUrl
+        }
+      }
+    }
+
+    const needsAnyProp = detailProps.some((p) => isMissingValue(item[p.name_schema]))
+    if (!needsAnyProp) continue
+
+    try {
+      const response = await chrome.runtime.sendMessage({
+        type: 'FETCH_PAGE',
+        url: detailUrl
+      })
+      if (!response?.success || !response?.html) continue
+      if (isChallengePage(response.html, detailUrl)) continue
+
+      const parser = new DOMParser()
+      const doc = parser.parseFromString(response.html, 'text/html')
+
+      let filled = false
+      for (const prop of detailProps) {
+        if (!isMissingValue(item[prop.name_schema])) continue
+        const value = extractPropertyFromDetailDoc(doc, prop, detailUrl)
+        if (!isMissingValue(value)) {
+          item[prop.name_schema] = value
+          filled = true
+        }
+      }
+      if (filled) detailHits++
+    } catch {
+      // Ignorar fallos por item detalle para no romper scraping principal.
+    }
+  }
+
+  return {
+    ...result,
+    results: enriched,
+    detailEnrichedItems: detailHits
+  } as ScrapeResult & { detailEnrichedItems: number }
+}
+
+function isLikelyDetailProperty(name: string): boolean {
+  const key = toSafeKey(name)
+  return (
+    key.includes('doi') ||
+    key.includes('volume') ||
+    key.includes('issue') ||
+    key.includes('pages') ||
+    key.includes('issn') ||
+    key.includes('isbn')
+  )
+}
+
+function isMissingValue(value: any): boolean {
+  return value === null || value === undefined || String(value).trim() === ''
+}
+
+function resolveAbsoluteUrl(rawUrl: string, baseUrl: string): string | null {
+  try {
+    return new URL(rawUrl, baseUrl).toString()
+  } catch {
+    return null
+  }
+}
+
+function extractPropertyFromDetailDoc(doc: Document, prop: PropertySchema, detailUrl: string): any {
+  const key = toSafeKey(prop.name_schema)
+
+  if (key.includes('doi')) {
+    const metaDoi = (
+      doc.querySelector('meta[name="citation_doi"]') as HTMLMetaElement | null
+    )?.content
+      || (doc.querySelector('meta[name="dc.identifier"]') as HTMLMetaElement | null)?.content
+      || (doc.querySelector('meta[name="DC.Identifier"]') as HTMLMetaElement | null)?.content
+    if (metaDoi && metaDoi.trim()) return metaDoi.trim()
+
+    const doiLink = doc.querySelector('a[href*="doi.org"], a[href*="/doi/"]') as HTMLAnchorElement | null
+    const doiHref = doiLink?.getAttribute('href') || ''
+    if (doiHref) {
+      const m = doiHref.match(/10\.\d{4,9}\/[-._;()/:A-Z0-9]+/i)
+      if (m?.[0]) return m[0]
+    }
+
+    const text = doc.body?.textContent || ''
+    const m = text.match(/\b10\.\d{4,9}\/[-._;()/:A-Z0-9]+\b/i)
+    if (m?.[0]) return m[0]
+
+    const doiFromUrl = extractDoiFromUrl(detailUrl)
+    if (doiFromUrl) return doiFromUrl
+    return ''
+  }
+
+  if (key.includes('volume')) {
+    const metaVolume = (doc.querySelector('meta[name="citation_volume"]') as HTMLMetaElement | null)?.content
+    if (metaVolume && metaVolume.trim()) return metaVolume.trim()
+
+    const text = doc.body?.textContent || ''
+    const m = text.match(/\b(?:vol(?:ume)?\.?\s*)(\d+)\b/i)
+    if (m?.[1]) return m[1]
+    return ''
+  }
+
+  if (key.includes('issue')) {
+    const metaIssue = (doc.querySelector('meta[name="citation_issue"]') as HTMLMetaElement | null)?.content
+    if (metaIssue && metaIssue.trim()) return metaIssue.trim()
+  }
+
+  if (key.includes('pages')) {
+    const first = (doc.querySelector('meta[name="citation_firstpage"]') as HTMLMetaElement | null)?.content
+    const last = (doc.querySelector('meta[name="citation_lastpage"]') as HTMLMetaElement | null)?.content
+    if (first && last) return `${first}-${last}`
+    if (first) return first
+  }
+
+  // Fallback final: intentar selector configurado sobre la página de detalle.
+  if (prop.selector_css_schema) {
+    const el = doc.querySelector(prop.selector_css_schema)
+    if (el) {
+      if (prop.type_schema === 'url') {
+        return (el as HTMLAnchorElement).getAttribute('href') || ''
+      }
+      return el.textContent?.trim() || ''
+    }
+  }
+
+  // Si no se pudo extraer, devolver vacío y seguir.
+  return ''
+}
+
+function extractDoiFromUrl(url: string): string {
+  const decoded = decodeURIComponent(url || '')
+  const doiMatch = decoded.match(/10\.\d{4,9}\/[-._;()/:A-Z0-9]+/i)
+  return doiMatch?.[0] || ''
+}
+
+function isInvisibleBlockedError(message: string): boolean {
+  const m = (message || '').toLowerCase()
+  return (
+    m.includes('challenge') ||
+    m.includes('anti-bot') ||
+    m.includes('bloque') ||
+    m.includes('no devolvió resultados parseables en modo invisible') ||
+    m.includes('no se pudo obtener html invisible')
+  )
 }
 
 function extractBestCitationValueFromItem(item: Record<string, any>): number | string | null {

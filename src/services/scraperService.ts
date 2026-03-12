@@ -247,9 +247,16 @@ function extractItemGeneric(
       const baseValue = selector_css_schema
         ? extractByType(element, selector_css_schema, type_schema)
         : ''
-      item[name_schema] = withSemanticFallback(element, name_schema, type_schema, baseValue)
+      const resolvedValue = withSemanticFallback(element, name_schema, type_schema, baseValue)
+      item[name_schema] = isTitleKey(key)
+        ? normalizeTitleValue(element, resolvedValue)
+        : resolvedValue
     } catch {
-      item[name_schema] = withSemanticFallback(element, name_schema, type_schema, '')
+      const key = normalizePropertyKey(name_schema)
+      const resolvedValue = withSemanticFallback(element, name_schema, type_schema, '')
+      item[name_schema] = isTitleKey(key)
+        ? normalizeTitleValue(element, resolvedValue)
+        : resolvedValue
     }
   }
 
@@ -414,6 +421,64 @@ function isCitationKey(normalizedKey: string): boolean {
     normalizedKey.includes('numerodecitas') ||
     normalizedKey.includes('numerocitas')
   )
+}
+
+function isTitleKey(normalizedKey: string): boolean {
+  return (
+    normalizedKey.includes('title') ||
+    normalizedKey.includes('titulo') ||
+    normalizedKey === 'name' ||
+    normalizedKey.endsWith('name')
+  )
+}
+
+function normalizeTitleValue(element: HTMLElement, currentValue: any): string {
+  const text = String(currentValue ?? '').trim()
+  if (text && !isLikelyBadgeText(text)) return text
+
+  const strongCandidates = [
+    'h1 a[href]',
+    'h2 a[href]',
+    'h3 a[href]',
+    'h1',
+    'h2',
+    'h3',
+    'a[href*="/article/"]',
+    'a[href*="/chapter/"]',
+    'a[href*="/book/"]',
+    '[data-test*="title"] a',
+    '[data-test*="title"]'
+  ]
+
+  for (const selector of strongCandidates) {
+    const candidate = element.querySelector(selector)
+    const candidateText = candidate?.textContent?.trim() || ''
+    if (candidateText && !isLikelyBadgeText(candidateText)) {
+      return candidateText
+    }
+  }
+
+  // Fallback conservador: primer texto suficientemente largo.
+  const anyText = (element.textContent || '')
+    .split('\n')
+    .map((s) => s.trim())
+    .find((s) => s.length > 20 && !isLikelyBadgeText(s))
+
+  return anyText || text
+}
+
+function isLikelyBadgeText(text: string): boolean {
+  const normalized = text.toLowerCase().replace(/\s+/g, ' ').trim()
+  const badgeValues = [
+    'full access',
+    'open access',
+    'access',
+    'preview',
+    'pdf',
+    'chapter',
+    'article'
+  ]
+  return badgeValues.includes(normalized)
 }
 
 function extractCitationForProperty(element: HTMLElement, selector: string): number {
