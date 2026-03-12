@@ -167,6 +167,42 @@ export async function getSiteNames(): Promise<string[]> {
  * Construir la URL de búsqueda a partir de la estructura y la query
  */
 export function buildSearchUrl(structure: SiteStructure, query: string): string {
-  let url = structure.search_url.replace('{query}', encodeURIComponent(query))
-  return url
+  const raw = (structure.search_url || '').trim()
+  if (!raw) return ''
+
+  // Caso ideal: plantilla explícita con {query}
+  if (raw.includes('{query}')) {
+    return raw.replace('{query}', encodeURIComponent(query))
+  }
+
+  // Fallback robusto: si la IA guardó una URL fija (ej. ...?query=iot),
+  // reemplazar dinámicamente el parámetro de búsqueda.
+  try {
+    const urlObj = new URL(raw)
+
+    const preferredParams = Object.keys(structure.search_params || {})
+    const commonParams = ['q', 'query', 'search', 'k', 'keyword', 'term']
+    const candidateParams = [...preferredParams, ...commonParams]
+
+    let updated = false
+    for (const param of candidateParams) {
+      if (urlObj.searchParams.has(param)) {
+        urlObj.searchParams.set(param, query)
+        updated = true
+        break
+      }
+    }
+
+    // Si no encontró parámetro existente, usar el más probable.
+    if (!updated) {
+      const fallbackParam = preferredParams[0] || 'query'
+      urlObj.searchParams.set(fallbackParam, query)
+    }
+
+    return urlObj.toString()
+  } catch {
+    // Último fallback para URLs no parseables.
+    const sep = raw.includes('?') ? '&' : '?'
+    return `${raw}${sep}query=${encodeURIComponent(query)}`
+  }
 }

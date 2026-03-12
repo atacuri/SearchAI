@@ -429,7 +429,7 @@ ${colorsList}
    - Parámetros: { "site": string, "query": string }
    - "site" es el nombre del sitio (ej: "Google Scholar", "Springer", "DBLP")
    - "query" es lo que el usuario quiere buscar
-   - Ejemplos: "en google scholar busca iot invisible", "busca machine learning en springer en segundo plano", "en dblp busca deep learning sin abrir pestaña"
+   - Ejemplos: "en google scholar busca iot invisible", "busca machine learning en springer en segundo plano", "en dblp busca deep learning sin abrir pestaña", "busca scraping en springer en background"
 
 5. searchSiteVisible: Busca en un sitio configurado y abre la búsqueda en una pestaña nueva (visible)
    - Parámetros: { "site": string, "query": string }
@@ -464,9 +464,11 @@ ${colorsList}
        "targetSite": string,
        "targetProperty": string,
        "selection": "first result" | "best result" | "All",
-       "maxItems": number
+       "maxItems": number,
+       "openSourceInSameTab": boolean
      }
-   - La búsqueda del sourceSite se ejecuta en modo invisible
+   - La búsqueda del sourceSite se ejecuta en modo invisible para obtener datos
+   - Si el usuario pide "en el mismo tab", "misma pestaña", "pestaña actual", "cargar springer" o "mostrar springer", usa "openSourceInSameTab": true
    - La búsqueda del targetSite se ejecuta en modo invisible por cada item del origen
    - "sourceProperty" suele ser "title"
    - "targetProperty" suele ser "citations"
@@ -497,13 +499,16 @@ INSTRUCCIONES:
       "targetSite": "Google Scholar",
       "targetProperty": "citations",
       "selection": "best result",
-      "maxItems": 10
+      "maxItems": 10,
+      "openSourceInSameTab": false
     }
   }
 - Si no entiendes el comando: { "action": null, "params": {} }
-- Por defecto, para frases tipo "en [sitio] busca [query]": usa searchSiteVisible
-- Si el usuario pide "invisible", "invisble", "invislbe", "invsible", "en segundo plano", "sin abrir pestaña": usa searchSite (modo invisible + extracción)
-- En sitios que bloquean el fetch invisible (ej. challenge anti-bot), el executor hará fallback automático a modo visible
+- Por defecto, para frases tipo "en [sitio] busca [query]": usa searchSite (invisible)
+- Si el usuario pide "invisible", "invisble", "invislbe", "invsible", "background", "en segundo plano", "sin abrir pestaña": usa searchSite (modo invisible + extracción)
+- Si el usuario pide "visible", "nueva pestaña", "abrir pestaña", "new tab": usa searchSiteVisible
+- searchSite es solo invisible (nunca abre pestaña). Si el sitio bloquea invisible, devuelve error.
+- searchSiteVisible es solo visible (abre la búsqueda en pestaña)
 - Para extraer datos de la página actual: usa scrapeResults
 - Para analizar/aprender la estructura de una página: usa createStructure
 - Para ver las estructuras guardadas: usa listStructures

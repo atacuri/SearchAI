@@ -45,6 +45,9 @@ export async function executePageCommand(command: DSLCommand): Promise<any> {
     case 'chainSearch':
       return await chainSearch(command.params)
 
+    case 'chainAugmentCurrentPage':
+      return await chainAugmentCurrentPage(command.params)
+
     default:
       throw new Error(`Comando desconocido: ${command.action}`)
   }
@@ -308,19 +311,15 @@ async function searchSite(siteName: string, query: string): Promise<any> {
   }
 
   if (isChallengePage(response.html || '', searchUrl)) {
-    // Springer (y algunos sitios similares) bloquean fetch de extensiones con páginas challenge.
-    const visibleFallback = await searchSiteVisible(siteName, query)
     return {
-      action: 'searchSite',
-      success: true,
-      source: structure.name,
+      action: 'searchSiteChallenge',
+      success: false,
+      site: structure.name,
       query,
       url: searchUrl,
-      blockedInvisible: true,
-      fallback: visibleFallback,
       message:
-        `El sitio "${structure.name}" bloqueó el modo invisible (anti-bot/challenge). ` +
-        `Se abrió la búsqueda en una pestaña visible para continuar.`
+        `El sitio "${structure.name}" bloqueó el modo invisible (challenge anti-bot). ` +
+        `Puedes abrir visible y continuar la extracción desde la extensión.`
     }
   }
 
@@ -341,18 +340,15 @@ async function searchSite(siteName: string, query: string): Promise<any> {
       message.includes('changed its structure')
 
     if (isSpringerSite && likelySelectorOrDynamicIssue) {
-      const visibleFallback = await searchSiteVisible(siteName, query)
       return {
-        action: 'searchSite',
-        success: true,
-        source: structure.name,
+        action: 'searchSiteChallenge',
+        success: false,
+        site: structure.name,
         query,
         url: searchUrl,
-        blockedInvisible: true,
-        fallback: visibleFallback,
         message:
-          `Springer no devolvió resultados parseables en modo invisible (HTML dinámico o protección anti-bot). ` +
-          `Se abrió la búsqueda en modo visible para continuar.`
+          `Springer no devolvió resultados parseables en modo invisible (HTML dinámico/protección anti-bot). ` +
+          `Puedes abrir visible y continuar la extracción desde la extensión.`
       }
     }
 
@@ -396,6 +392,9 @@ async function chainSearch(params: Record<string, any>): Promise<any> {
   const targetProperty = normalizeRequestedProperty(targetPropertyRaw)
   const selectionRaw = String(params?.selection || params?.type_of_search || 'best result').trim()
   const maxItems = Number(params?.maxItems || 10)
+  const openSourceInSameTab =
+    params?.openSourceInSameTab === true ||
+    String(params?.openSourceInSameTab || '').toLowerCase() === 'true'
 
   if (!sourceSite || !sourceQuery) {
     throw new Error(
@@ -408,6 +407,41 @@ async function chainSearch(params: Record<string, any>): Promise<any> {
   const targetStructure = await resolveStructureBySiteName(targetSite)
   if (!sourceStructure) throw new Error(`No se encontró estructura para sitio origen: "${sourceSite}".`)
   if (!targetStructure) throw new Error(`No se encontró estructura para sitio destino: "${targetSite}".`)
+  const sourceSearchUrl = buildSearchUrl(sourceStructure, sourceQuery)
+  const selection = normalizeSelectionType(selectionRaw)
+
+  if (openSourceInSameTab) {
+    if (!isCurrentPageFromStructure(sourceStructure, sourceQuery)) {
+      return {
+        action: 'chainSearchNavigate',
+        success: true,
+        source: sourceStructure.name,
+        sourceQuery,
+        sourceSearchUrl,
+        pendingTask: {
+          sourceSite: sourceStructure.name,
+          sourceQuery,
+          sourceProperty,
+          targetSite: targetStructure.name,
+          targetProperty,
+          selection,
+          maxItems,
+          openSourceInSameTab: true
+        },
+        message: `Abriendo ${sourceStructure.name} en la pestaña actual para aplicar augmentación con citas...`
+      }
+    }
+
+    return await chainAugmentCurrentPage({
+      sourceSite: sourceStructure.name,
+      sourceQuery,
+      sourceProperty,
+      targetSite: targetStructure.name,
+      targetProperty,
+      selection,
+      maxItems
+    })
+  }
 
   // Modo estable: ambas búsquedas en invisible para evitar abrir pestañas.
   const sourceResult = await searchSiteInvisibleRaw(sourceStructure, sourceQuery)
@@ -416,7 +450,6 @@ async function chainSearch(params: Record<string, any>): Promise<any> {
     throw new Error(`No se encontraron resultados en "${sourceStructure.name}" para "${sourceQuery}".`)
   }
 
-  const selection = normalizeSelectionType(selectionRaw)
   const enrichedField = `${toSafeKey(targetStructure.name)}_${toSafeKey(targetProperty)}`
   const enrichedItems: Record<string, any>[] = []
   const errors: string[] = []
@@ -469,6 +502,8 @@ async function chainSearch(params: Record<string, any>): Promise<any> {
     sourceQuery,
     sourceProperty,
     targetProperty,
+    sourceSearchUrl,
+    openSourceInSameTab,
     selection,
     totalSourceItems: sourceItems.length,
     enrichedItems: enrichedCount,
@@ -476,6 +511,85 @@ async function chainSearch(params: Record<string, any>): Promise<any> {
     errors,
     message:
       `Cadena completada: ${sourceStructure.name} -> ${targetStructure.name}. ` +
+      `Se enriquecieron ${enrichedCount} de ${sourceItems.length} items con "${targetProperty}".`
+  }
+}
+
+async function chainAugmentCurrentPage(params: Record<string, any>): Promise<any> {
+  const sourceProperty = String(params?.sourceProperty || 'title').trim()
+  const targetSite = String(params?.targetSite || 'Google Scholar').trim()
+  const targetPropertyRaw = String(params?.targetProperty || 'citations').trim()
+  const targetProperty = normalizeRequestedProperty(targetPropertyRaw)
+  const selectionRaw = String(params?.selection || params?.type_of_search || 'best result').trim()
+  const maxItems = Number(params?.maxItems || 10)
+
+  const sourceStructure = await resolveStructureByUrl(window.location.href)
+  if (!sourceStructure) {
+    throw new Error('No hay estructura para la página actual. Navega a resultados del sitio origen y crea estructura.')
+  }
+  const targetStructure = await resolveStructureBySiteName(targetSite)
+  if (!targetStructure) throw new Error(`No se encontró estructura para sitio destino: "${targetSite}".`)
+
+  const sourceData = await scrapeCurrentPage()
+  const sourceItems = Array.isArray(sourceData.results) ? sourceData.results.slice(0, Math.max(1, maxItems)) : []
+  const containers = Array.from(document.querySelectorAll(sourceStructure.result_container_selector)) as HTMLElement[]
+  const selection = normalizeSelectionType(selectionRaw)
+  const enrichedField = `${toSafeKey(targetStructure.name)}_${toSafeKey(targetProperty)}`
+
+  let enrichedCount = 0
+  const errors: string[] = []
+  const results = sourceItems.map((item) => ({ ...item }))
+
+  for (let i = 0; i < results.length; i++) {
+    const sourceItem = results[i]
+    const seedQuery = String(readPropertyByAlias(sourceItem, sourceProperty) || '').trim()
+    if (!seedQuery) {
+      sourceItem[enrichedField] = selection === 'All' ? [] : null
+      continue
+    }
+
+    try {
+      const targetResult = await searchSiteInvisibleRaw(targetStructure, seedQuery)
+      const targetItems = Array.isArray(targetResult.results) ? targetResult.results : []
+      const selected = selectTargetItems(targetItems, seedQuery, selection)
+      const isCitationsTarget = toSafeKey(targetProperty) === 'citations'
+      const selectedValues = selected
+        .map(item =>
+          isCitationsTarget
+            ? extractBestCitationValueFromItem(item)
+            : readPropertyByAlias(item, targetProperty)
+        )
+        .filter(v => v !== '' && v !== null && v !== undefined)
+
+      const value = selection === 'All' ? selectedValues : (selectedValues[0] ?? null)
+      sourceItem[enrichedField] = value
+      sourceItem[`${toSafeKey(targetStructure.name)}_match_count`] = selected.length
+      if ((Array.isArray(value) && value.length > 0) || (!Array.isArray(value) && value !== null && value !== '')) {
+        enrichedCount++
+      }
+      applyAugmentationToContainer(containers[i], value, targetStructure.name)
+    } catch (err: any) {
+      sourceItem[enrichedField] = selection === 'All' ? [] : null
+      errors.push(`"${seedQuery}": ${err?.message || 'error al consultar sitio destino'}`)
+    }
+  }
+
+  return {
+    action: 'chainSearch',
+    success: true,
+    augmentedOnPage: true,
+    source: sourceStructure.name,
+    target: targetStructure.name,
+    sourceQuery: params?.sourceQuery || sourceData.query || '',
+    sourceProperty,
+    targetProperty,
+    selection,
+    totalSourceItems: sourceItems.length,
+    enrichedItems: enrichedCount,
+    results,
+    errors,
+    message:
+      `Augmentación aplicada en la página: ${sourceStructure.name} -> ${targetStructure.name}. ` +
       `Se enriquecieron ${enrichedCount} de ${sourceItems.length} items con "${targetProperty}".`
   }
 }
@@ -736,6 +850,49 @@ function normalizeText(text: string): string {
     .replace(/[^a-z0-9 ]/g, ' ')
     .replace(/\s+/g, ' ')
     .trim()
+}
+
+function isCurrentPageFromStructure(structure: SiteStructure, query?: string): boolean {
+  try {
+    const currentHost = new URL(window.location.href).hostname
+    const sourceHost = new URL(structure.url).hostname
+    const sameSite = currentHost.includes(sourceHost) || sourceHost.includes(currentHost)
+    if (!sameSite) return false
+    if (!query) return true
+    return window.location.href.toLowerCase().includes(encodeURIComponent(query).toLowerCase())
+  } catch {
+    return false
+  }
+}
+
+function applyAugmentationToContainer(container: HTMLElement | undefined, value: any, targetSiteName: string) {
+  if (!container) return
+  container.querySelectorAll('[data-ai-augment-citation="1"]').forEach(el => el.remove())
+
+  const isEmpty = value === null || value === undefined || value === '' || (Array.isArray(value) && value.length === 0)
+  if (isEmpty) return
+  const valueText = Array.isArray(value) ? value.join(', ') : String(value)
+  if (!valueText) return
+
+  const badge = document.createElement('span')
+  badge.setAttribute('data-ai-augment-citation', '1')
+  badge.textContent = `Citas (${targetSiteName}): ${valueText}`
+  badge.style.display = 'inline-block'
+  badge.style.marginLeft = '8px'
+  badge.style.padding = '2px 8px'
+  badge.style.borderRadius = '999px'
+  badge.style.fontSize = '11px'
+  badge.style.fontWeight = '600'
+  badge.style.background = 'rgba(37, 99, 235, 0.12)'
+  badge.style.color = '#1d4ed8'
+  badge.style.border = '1px solid rgba(37, 99, 235, 0.35)'
+
+  const anchor = container.querySelector('h1, h2, h3, a') as HTMLElement | null
+  if (anchor && anchor.parentElement) {
+    anchor.insertAdjacentElement('afterend', badge)
+  } else {
+    container.prepend(badge)
+  }
 }
 
 function extractBestCitationValueFromItem(item: Record<string, any>): number | string | null {

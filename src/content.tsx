@@ -9,6 +9,9 @@ import { executePageCommand } from "./dsl/pageExecutor"
 import { getAIConfig, saveAIConfig, clearAIConfig, type AIConfig } from "./services/aiService"
 
 const BUILD_TAG = "springer-fix-4"
+const LAST_CHAIN_RESULT_KEY = "ai_last_chain_result"
+const PENDING_CHAIN_TASK_KEY = "ai_pending_chain_task"
+const PENDING_VISIBLE_SCRAPE_KEY = "ai_pending_visible_scrape"
 
 // Configuración del content script
 export const config: PlasmoCSConfig = {
@@ -404,6 +407,14 @@ export const getStyle: PlasmoGetStyle = () => {
       border: 1px solid #ff4444;
       border-radius: 8px;
       color: #cc0000;
+    }
+
+    .result-warning {
+      padding: 10px 12px;
+      background: #fff8e1;
+      border: 1px solid #ffb300;
+      border-radius: 8px;
+      color: #8a5a00;
     }
 
     .result-titles {
@@ -816,6 +827,65 @@ function FloatingPrompt() {
   const [apiKey, setApiKey] = useState('')
   const [model, setModel] = useState('')
   const [configSaved, setConfigSaved] = useState(false)
+  const [runningPendingChain, setRunningPendingChain] = useState(false)
+  const [runningPendingVisible, setRunningPendingVisible] = useState(false)
+
+  useEffect(() => {
+    chrome.storage.local.get(LAST_CHAIN_RESULT_KEY).then((stored) => {
+      const prev = stored?.[LAST_CHAIN_RESULT_KEY]
+      if (prev && prev.action === "chainSearch") {
+        setResult(prev)
+      }
+    }).catch(() => {
+      // noop
+    })
+  }, [])
+
+  useEffect(() => {
+    if (runningPendingChain) return
+    setRunningPendingChain(true)
+    chrome.storage.local.get(PENDING_CHAIN_TASK_KEY).then(async (stored) => {
+      const pending = stored?.[PENDING_CHAIN_TASK_KEY]
+      if (!pending) return
+      if (!isCurrentUrlForSite(pending.sourceSite)) return
+
+      try {
+        setLoading(true)
+        const res = await executePageCommand({
+          action: 'chainAugmentCurrentPage',
+          params: pending
+        })
+        setResult(res)
+        await chrome.storage.local.set({ [LAST_CHAIN_RESULT_KEY]: res })
+      } catch (err: any) {
+        setError(err?.message || 'Error ejecutando augmentación pendiente')
+      } finally {
+        await chrome.storage.local.remove(PENDING_CHAIN_TASK_KEY)
+        setLoading(false)
+      }
+    }).finally(() => setRunningPendingChain(false))
+  }, [runningPendingChain])
+
+  useEffect(() => {
+    if (runningPendingVisible) return
+    setRunningPendingVisible(true)
+    chrome.storage.local.get(PENDING_VISIBLE_SCRAPE_KEY).then(async (stored) => {
+      const pending = stored?.[PENDING_VISIBLE_SCRAPE_KEY]
+      if (!pending) return
+      if (!isCurrentUrlForSite(pending.site)) return
+
+      try {
+        setLoading(true)
+        const res = await executePageCommand({ action: 'scrapeResults', params: {} })
+        setResult(res)
+      } catch (err: any) {
+        setError(err?.message || 'No se pudo continuar extracción visible')
+      } finally {
+        await chrome.storage.local.remove(PENDING_VISIBLE_SCRAPE_KEY)
+        setLoading(false)
+      }
+    }).finally(() => setRunningPendingVisible(false))
+  }, [runningPendingVisible])
 
   useEffect(() => {
     if (isOpen) {
@@ -887,6 +957,9 @@ function FloatingPrompt() {
       lower.includes('invisble') ||
       lower.includes('invislbe') ||
       lower.includes('invsible') ||
+      lower.includes('background') ||
+      lower.includes('backgroud') ||
+      lower.includes('backgrond') ||
       lower.includes('segundo plano') ||
       lower.includes('sin abrir pestaña') ||
       lower.includes('sin abrir pestana') ||
@@ -894,13 +967,42 @@ function FloatingPrompt() {
     )
   }
 
+  const hasVisibleIntent = (text: string): boolean => {
+    const lower = text.toLowerCase().trim()
+    return (
+      lower.includes('visible') ||
+      lower.includes('nueva pesta') ||
+      lower.includes('nuevo tab') ||
+      lower.includes('new tab') ||
+      lower.includes('mostrar busqueda') ||
+      lower.includes('mostrar búsqueda') ||
+      lower.includes('abrir pesta') ||
+      lower.includes('open tab')
+    )
+  }
+
+  const isCurrentUrlForSite = (siteName: string): boolean => {
+    const lower = (siteName || '').toLowerCase()
+    const href = window.location.href.toLowerCase()
+    if (lower.includes('springer')) return href.includes('springer.com')
+    if (lower.includes('scholar')) return href.includes('scholar.google.')
+    if (lower.includes('dblp')) return href.includes('dblp.org')
+    if (lower.includes('amazon')) return href.includes('amazon.')
+    return false
+  }
+
   const sanitizeSearchQuery = (query: string): string => {
     return query
       .replace(/\ben\s+segundo\s+plano\b/gi, ' ')
+      .replace(/\ben\s+background\b/gi, ' ')
+      .replace(/\ben\s+backgroud\b/gi, ' ')
+      .replace(/\ben\s+backgrond\b/gi, ' ')
+      .replace(/\bin\s+background\b/gi, ' ')
+      .replace(/\bin\s+backgroud\b/gi, ' ')
       .replace(/\bsin\s+abrir\s+pestaña\b/gi, ' ')
       .replace(/\bsin\s+abrir\s+pestana\b/gi, ' ')
       .replace(/\bsin\s+abrir\s+tab\b/gi, ' ')
-      .replace(/\b(invisible|invisble|invislbe|invsible|visible)\b/gi, ' ')
+      .replace(/\b(invisible|invisble|invislbe|invsible|visible|background|backgroud|backgrond)\b/gi, ' ')
       .replace(/\s+/g, ' ')
       .trim()
   }
@@ -961,6 +1063,13 @@ function FloatingPrompt() {
 
     const sourceProperty = lower.includes('titulo') || lower.includes('title') ? 'title' : 'title'
     const selection = normalizeSelectionText(lower)
+    const openSourceInSameTab =
+      lower.includes('mismo tab') ||
+      lower.includes('misma pesta') ||
+      lower.includes('pestaña actual') ||
+      lower.includes('pestana actual') ||
+      lower.includes('cargar springer') ||
+      lower.includes('mostrar springer')
 
     return {
       action: 'chainSearch',
@@ -971,12 +1080,13 @@ function FloatingPrompt() {
         targetSite,
         targetProperty,
         selection,
-        maxItems: 10
+        maxItems: 10,
+        openSourceInSameTab
       }
     }
   }
 
-  const normalizeSearchCommandParams = (cmd: DSLCommand): DSLCommand => {
+  const normalizeSearchCommandParams = (cmd: DSLCommand, rawInput: string = ''): DSLCommand => {
     if (cmd.action !== 'searchSite' && cmd.action !== 'searchSiteVisible') return cmd
     const currentSite = String(cmd.params?.site || '').trim()
     const currentQuery = String(cmd.params?.query || '').trim()
@@ -996,19 +1106,20 @@ function FloatingPrompt() {
     if (chainIntent) return chainIntent
 
     const wantsInvisible = hasInvisibleIntent(rawInput)
+    const wantsVisible = hasVisibleIntent(rawInput)
 
-    // Si la IA devolvió búsqueda de sitio, forzar modo visible/invisible según el texto
-    if (parsed?.action === 'searchSite' && !wantsInvisible) {
+    // Política: por defecto las búsquedas son invisibles. Visible solo si el usuario lo pide explícitamente.
+    if (parsed?.action === 'searchSite' && wantsVisible) {
       return normalizeSearchCommandParams({
         action: 'searchSiteVisible',
         params: parsed.params
-      })
+      }, rawInput)
     }
-    if (parsed?.action === 'searchSiteVisible' && wantsInvisible) {
+    if (parsed?.action === 'searchSiteVisible' && !wantsVisible) {
       return normalizeSearchCommandParams({
         action: 'searchSite',
         params: parsed.params
-      })
+      }, rawInput)
     }
 
     // Fallback regex para frases comunes, incluso si la IA falla
@@ -1018,8 +1129,11 @@ function FloatingPrompt() {
       const query = inSiteMatch[2]?.trim()
       if (site && query) {
         return {
-          action: wantsInvisible ? 'searchSite' : 'searchSiteVisible',
-          params: { site, query: sanitizeSearchQuery(query) || query }
+          action: wantsVisible ? 'searchSiteVisible' : 'searchSite',
+          params: {
+            site,
+            query: sanitizeSearchQuery(query) || query
+          }
         }
       }
     }
@@ -1030,21 +1144,25 @@ function FloatingPrompt() {
       const site = searchInMatch[2]?.trim()
       if (site && query) {
         return {
-          action: wantsInvisible ? 'searchSite' : 'searchSiteVisible',
-          params: { site, query: sanitizeSearchQuery(query) || query }
+          action: wantsVisible ? 'searchSiteVisible' : 'searchSite',
+          params: {
+            site,
+            query: sanitizeSearchQuery(query) || query
+          }
         }
       }
     }
 
-    return parsed ? normalizeSearchCommandParams(parsed) : parsed
+    return parsed ? normalizeSearchCommandParams(parsed, rawInput) : parsed
   }
 
   const extractVisibleSearchIntent = (rawInput: string): { site: string; query: string } | null => {
     const text = rawInput.trim()
     if (extractChainSearchIntent(text)) return null
     const wantsInvisible = hasInvisibleIntent(text)
+    const wantsVisible = hasVisibleIntent(text)
 
-    if (wantsInvisible) return null
+    if (wantsInvisible || !wantsVisible) return null
 
     const inSiteMatch = text.match(/en\s+(.+?)\s+busca(?:r)?\s+(.+)/i)
     if (inSiteMatch?.[1] && inSiteMatch?.[2]) {
@@ -1122,7 +1240,15 @@ function FloatingPrompt() {
       }
 
       setResult(res)
+      if (res?.action === 'chainSearch') {
+        await chrome.storage.local.set({ [LAST_CHAIN_RESULT_KEY]: res })
+      }
       setInput("")
+      if (res?.action === 'chainSearchNavigate' && res?.sourceSearchUrl) {
+        await chrome.storage.local.set({ [PENDING_CHAIN_TASK_KEY]: res.pendingTask })
+        window.location.href = res.sourceSearchUrl
+        return
+      }
     } catch (err: any) {
       if (preOpenedTab && !preOpenedTab.closed && visibleIntent) {
         const localUrl = buildLocalSearchUrl(visibleIntent.site, visibleIntent.query)
@@ -1159,6 +1285,23 @@ function FloatingPrompt() {
       setResult(res)
     } catch (err: any) {
       setError(err.message || "Error al ejecutar")
+    }
+  }
+
+  const openVisibleAndContinue = async (site: string, query: string) => {
+    setError(null)
+    try {
+      await chrome.storage.local.set({
+        [PENDING_VISIBLE_SCRAPE_KEY]: { site, query, createdAt: Date.now() }
+      })
+      const res = await executePageCommand({
+        action: 'searchSiteVisible',
+        params: { site, query }
+      })
+      setResult(res)
+    } catch (err: any) {
+      setError(err?.message || 'No se pudo abrir visible para continuar')
+      await chrome.storage.local.remove(PENDING_VISIBLE_SCRAPE_KEY)
     }
   }
 
@@ -1475,6 +1618,35 @@ function FloatingPrompt() {
                   <div style={{ marginTop: "6px", fontSize: "11px" }}>
                     🔗 <a href={result.url} target="_blank" rel="noopener noreferrer">{result.url}</a>
                   </div>
+                </div>
+              </div>
+            )}
+
+            {result && result.action === "searchSiteChallenge" && (
+              <div className="result-area">
+                <div className="result-warning">
+                  ⚠️ {result.message}
+                  <div style={{ marginTop: "8px", display: "flex", gap: "8px", alignItems: "center" }}>
+                    <button
+                      className="ai-save-btn"
+                      style={{ maxWidth: "220px" }}
+                      onClick={() => openVisibleAndContinue(result.site, result.query)}>
+                      Abrir visible y continuar
+                    </button>
+                    {result.url && (
+                      <a href={result.url} target="_blank" rel="noopener noreferrer" style={{ fontSize: "11px" }}>
+                        Ver URL
+                      </a>
+                    )}
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {result && result.action === "chainSearchNavigate" && (
+              <div className="result-area">
+                <div className="result-success">
+                  🚀 {result.message}
                 </div>
               </div>
             )}
