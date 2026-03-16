@@ -13,6 +13,54 @@ export interface DSLCommand {
     params: Record<string, any>
 }
 
+export type ConditionEffect = 'highlight' | 'hide' | 'remove'
+
+export interface ConditionCommandDefinition {
+    name: string
+    effect: ConditionEffect
+    triggers?: string[]
+    createdAt: string
+}
+
+export interface ListConditionCommandsResult {
+    action: 'listConditionCommands'
+    commands: ConditionCommandDefinition[]
+    total: number
+}
+
+export interface ScriptCommandDefinition {
+    name: string
+    description?: string
+    code: string
+    plan?: ScriptCommandPlan
+    triggers?: string[]
+    createdAt: string
+}
+
+export interface ListScriptCommandsResult {
+    action: 'listScriptCommands'
+    commands: ScriptCommandDefinition[]
+    total: number
+}
+
+export type ScriptPlanStepType =
+    | 'popup_elements'
+    | 'highlight_elements'
+    | 'hide_elements'
+    | 'remove_elements'
+    | 'console_log'
+
+export interface ScriptPlanStep {
+    type: ScriptPlanStepType
+    title?: string
+    maxItems?: number
+    maxChars?: number
+}
+
+export interface ScriptCommandPlan {
+    steps: ScriptPlanStep[]
+}
+
 export interface ColorOption {
     name: string
     value: string | null
